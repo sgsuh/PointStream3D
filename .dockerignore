@@ -1,0 +1,7 @@
+node_modules
+dist
+.git
+*.log
+# Large sample data is bind-mounted at runtime; keep it out of the image.
+public/data
+*.laz

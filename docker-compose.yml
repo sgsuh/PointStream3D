@@ -1,0 +1,17 @@
+# PointStream3D dev environment.
+#   docker compose up --build       -> Vite dev server on http://localhost:5173
+#   docker compose run --rm web npm run smoke   -> headless data-pipeline check
+services:
+  web:
+    build: .
+    ports:
+      - "5173:5173"
+    volumes:
+      # Bind-mount source for hot reload...
+      - .:/app
+      # ...but keep container's node_modules (populated from the image).
+      - node_modules:/app/node_modules
+    command: npm run dev
+
+volumes:
+  node_modules:

@@ -1,109 +1,179 @@
 # PointStream3D
 
 Stream and render **COPC** (Cloud Optimized Point Cloud) files **directly in CesiumJS** —
-no server-side tiling, no pre-conversion. Point a browser at a `.copc.laz` file and see it
-on the globe.
+no server-side tiling, no pre-conversion. Point it at a `.copc.laz` URL and it renders on
+the globe, with eye-dome lighting and point attenuation applied by the engine.
 
-> KOSSA 2026 오픈소스 개발자대회 · Gaia3D 지정과제. 설계 근거는 [`docs/architecture.md`](docs/architecture.md) 참고.
+> KOSSA 2026 오픈소스 개발자대회 · Gaia3D 지정과제. 설계 근거와 측정 로그는
+> [`docs/architecture.md`](docs/architecture.md) 참고.
 
-## Status: Week 0 PoC ✅
+## How it works
 
-The end-to-end data path is validated: `copc.js` range-reads a COPC file, `laz-perf` (WASM)
-decodes it in the browser, the source CRS is reprojected to ECEF, and points render on the
-CesiumJS globe. Verified headlessly against real geolocated LiDAR (Autzen Stadium, Oregon):
+A Service Worker intercepts tile requests and transcodes the COPC octree into 3D Tiles on
+the fly — tileset documents and `pnts` tiles, generated only for what the camera asks for.
+That means **Cesium drives level of detail, frustum culling, request scheduling and
+memory**, and its point-cloud shading applies to our tiles for free. Large files stay lazy:
+each COPC hierarchy page becomes an external tileset the worker resolves on demand, so only
+the visible part of the octree is ever fetched.
 
-```
-Done — 300,000 points from 9 octree nodes (depth ≤ 3)
-```
-
-Two render paths exist:
-
-- **`index.html`** — simple `PointPrimitiveCollection` PoC (proves the data pipeline).
-- **`tiles.html`** — the **chosen architecture**: a Service Worker transcodes COPC octree
-  nodes to `pnts` on the fly, and `Cesium3DTileset` streams them with **Eye-Dome Lighting +
-  attenuation applied by the engine for free**. This is the make-or-break for Option A —
-  validated headlessly. Scales to large files via **lazy external tilesets**: each COPC
-  hierarchy page (and every `CHUNK_LEVELS` boundary) becomes a `page.json` external tileset
-  the SW serves on demand, so only the visible octree is fetched.
-
-Build the Service Worker bundle before opening `tiles.html`:
+## Install
 
 ```bash
-docker compose run --rm web npm run build:sw     # -> public/copc-sw.js + public/laz-perf.wasm
-# then open http://localhost:5173/tiles.html
+npm install pointstream3d cesium
 ```
 
-> Service Workers need a secure context: `http://localhost` works; other hosts don't.
+`cesium` is a peer dependency — it is never bundled.
 
-### Streaming a large remote file (multi-page)
+### Serve the two runtime assets
 
-Remote COPC files are proxied as same-origin (Range-forwarded) so the browser can
-stream them without CORS or a full download. Example: `sofi.copc.laz` (364M points,
-2 GB, 111 hierarchy sub-pages) streamed straight from S3:
+The package ships a prebuilt Service Worker and the laz-perf WASM. Both must be served by
+your app, **side by side** (the worker resolves the wasm relative to its own URL):
 
 ```
-http://localhost:5173/tiles.html?src=/remote-s3/hobu-lidar/sofi.copc.laz&zoom=0.05&sse=2
+node_modules/pointstream3d/dist/pointstream3d-sw.js
+node_modules/pointstream3d/dist/laz-perf.wasm
 ```
 
-The Service Worker lazily loads only the hierarchy pages and nodes the view needs.
-Validate the sub-page path headlessly (no browser, range reads only):
+Copy them into your static directory (e.g. `public/`) as a build step:
+
+```json
+{
+  "scripts": {
+    "postinstall": "cp node_modules/pointstream3d/dist/{pointstream3d-sw.js,laz-perf.wasm} public/"
+  }
+}
+```
+
+> **Scope matters.** A Service Worker only receives fetch events from pages inside its
+> scope, so serve `pointstream3d-sw.js` from your app's base path — the site root for a
+> root-served app, or `/my-app/` for a project site. To serve it from a narrower path
+> anyway, widen the scope with a `Service-Worker-Allowed` response header.
+>
+> Service Workers also require a secure context: `https`, or `http://localhost` in
+> development.
+
+## Usage
+
+```ts
+import { Viewer } from 'cesium';
+import { COPCPointCloud } from 'pointstream3d';
+
+const viewer = new Viewer('cesiumContainer');
+
+const cloud = await COPCPointCloud.fromUrl('/data/autzen.copc.laz');
+viewer.scene.primitives.add(cloud.tileset);
+await viewer.zoomTo(cloud.tileset);
+```
+
+`cloud.tileset` is a plain `Cesium3DTileset`, so everything you already know applies —
+`tileset.style`, picking, `allTilesLoaded`, and the rest.
+
+Call `cloud.destroy()` when you're done: it destroys the tileset and tells the worker to
+drop its cached header and hierarchy pages for that file, which nothing else evicts.
+
+### Options
+
+```ts
+const cloud = await COPCPointCloud.fromUrl(url, {
+  serviceWorker: { url: '/pointstream3d-sw.js' },
+  maximumScreenSpaceError: 4,
+  pointCloudShading: { eyeDomeLighting: true, geometricErrorScale: 1.5 },
+  cacheBytes: 512 * 1024 * 1024,
+});
+```
+
+| option | default | notes |
+|---|---:|---|
+| `serviceWorker.url` | `pointstream3d-sw.js` next to the document base | set `register: false` if your app registers it |
+| `maximumScreenSpaceError` | `4` | pixels of allowed error before a tile refines |
+| `maxTilesPerChunk` | `512` | tiles per generated tileset document before deeper nodes are delegated |
+| `pointCloudShading.attenuation` | `true` | required for eye-dome lighting to do anything |
+| `pointCloudShading.eyeDomeLighting` | `true` | |
+| `pointCloudShading.geometricErrorScale` | `1.5` | splat size relative to point spacing; `1.0` leaves holes |
+| `pointCloudShading.maximumAttenuation` | `8` | pixel cap on point size |
+| `cacheBytes` / `maximumCacheOverflowBytes` | 512 MB | the point budget: bytes of tile content kept before eviction |
+| `dynamicScreenSpaceError` | `false` | only pays off on data much larger than the view |
+
+Defaults are measured, not guessed — see [`docs/architecture.md` §8.1](docs/architecture.md)
+for the sweeps behind them. `COPC_DEFAULTS` is exported if you want to build on them.
+
+Note that `geometricError` is emitted as the true point spacing **in metres**, measured
+through the reprojection, so these numbers mean the same thing across datasets whatever the
+source CRS units are. Cesium's own default of `16` is far too coarse against an accurate
+value.
+
+## Development
+
+Everything runs in Docker — no local Node/npm needed.
 
 ```bash
-docker compose run --rm web node scripts/smoke-subpage.mjs
-docker compose run --rm web node scripts/probe-copc.mjs <copc-url>   # report sub-page count
-```
+# Download public COPC samples into public/data/ (git-ignored)
+docker compose run --rm web sh scripts/fetch-data.sh
 
-## Everything runs in Docker
+# Build the Service Worker bundle, then start the dev server -> http://localhost:5173
+docker compose run --rm web npm run build:sw
+docker compose up -d
 
-No local Node/npm needed — the toolchain lives in the container.
+# Build the library (dist/), the demo site (dist-demo/), or type-check
+docker compose run --rm web npm run build
+docker compose run --rm web npm run build:demo
+docker compose run --rm web npm run typecheck
 
-```bash
-# 1) Download public COPC samples into public/data/ (git-ignored)
-./scripts/fetch-data.sh          # or run inside the container, see below
-
-# 2) Start the Vite dev server  ->  http://localhost:5173
-docker compose up --build
-
-# 3) Headless data-pipeline check (no browser): decode + reproject a file
+# Headless data-pipeline check (no browser): decode + reproject
 docker compose run --rm web npm run smoke public/data/autzen.copc.laz
 
-# 4) Type-check + production build
-docker compose run --rm web npm run build
+# Report a file's hierarchy pages and cube-vs-data extent
+docker compose run --rm web node scripts/probe-copc.mjs public/data/autzen.copc.laz
 ```
 
-If you don't have `curl`/`bash` on the host, fetch samples inside the container:
+Demo pages: `tiles.html` is the library demo; `index.html` is the original
+`PointPrimitiveCollection` PoC that proved the data pipeline.
 
-```bash
-docker compose run --rm web sh scripts/fetch-data.sh
+### Streaming a large remote file
+
+Remote COPC files are proxied as same-origin (Range-forwarded) so the browser can stream
+them without CORS or a full download. `sofi.copc.laz` — 364M points, 2 GB, 111 hierarchy
+sub-pages — straight from S3:
+
+```
+http://localhost:5173/tiles.html?src=/remote-s3/hobu-lidar/sofi.copc.laz&zoom=0.05
 ```
 
-### Headless render verification (optional)
+### Headless render verification
 
-Screenshots the running app via the official Puppeteer image (SwiftShader WebGL),
-attached to the compose network:
+Screenshots the running app via the official Puppeteer image (SwiftShader WebGL), attached
+to the compose network, and dumps LOD metrics from `Cesium3DTileset.statistics`:
 
 ```bash
 mkdir -p poc-out && chmod 777 poc-out
 docker run --rm --network pointstream3d_default \
-  -e TARGET_URL=http://web:5173/ -e OUT=/out/poc.png \
+  -e TARGET_URL="http://web:5173/tiles.html" -e OUT=/out/x.png \
   -v "$PWD/scripts:/home/pptruser/work:ro" -v "$PWD/poc-out:/out" \
   -w /home/pptruser/work --entrypoint node \
   ghcr.io/puppeteer/puppeteer:latest screenshot.mjs
 ```
 
+The demo exposes every LOD knob as a query parameter (`?sse=`, `?ges=`, `?mt=`, `?cache=`,
+`?dyn=`), plus `?cam=lon,lat,height,heading,pitch`. **Pin `?cam=` for any A/B run** —
+`zoomTo()` frames from the root bounding volume, so changing a bounding volume silently
+reframes the shot and invalidates the comparison. `screenshot.mjs` prints a reusable `cam`
+string.
+
 ## Layout
 
 ```
-docs/architecture.md    Architecture decision (Option A: dynamic 3D Tiles) + rationale
-index.html              PoC page
-src/main.ts             PoC entry: Cesium viewer, load COPC, render points
-src/core/CopcSource.ts  copc.js wrapper: HTTP-range getter, hierarchy, node decode
-src/core/reproject.ts   source CRS (WKT) -> ECEF via proj4
-src/core/wkt.ts         WKT helpers (compound-CRS extraction, feet->metre)
-scripts/smoke.mjs       headless decode + reproject check (Node)
-scripts/screenshot.mjs  headless render verification (Puppeteer)
-Dockerfile              node:22-slim dev/build image
-docker-compose.yml      dev server + one-off commands
+src/index.ts              public entry point
+src/COPCPointCloud.ts     public API: COPCPointCloud.fromUrl(), options, defaults
+src/sw/sw.ts              Service Worker: serves tileset.json / page.json / *.pnts
+src/core/
+  CopcSource.ts           copc.js wrapper: HTTP-range getter, hierarchy, node decode
+  tileset.ts              COPC hierarchy page -> 3D Tiles chunk + external tilesets
+  bounds.ts               node cube -> tight oriented box, clamped to real extent
+  georef.ts / ecef.ts     Cesium-free reprojection (runs inside the worker)
+  pnts.ts                 pnts encoder (RTC_CENTER, float32)
+  wkt.ts                  WKT helpers: compound-CRS extraction, feet -> metre
+scripts/                  build-sw, smoke, probe-copc, screenshot (headless harness)
+docs/architecture.md      architecture decision + verification and tuning log
 ```
 
 ## Sample data
@@ -111,10 +181,9 @@ docker-compose.yml      dev server + one-off commands
 | file | size | notes |
 |------|------|-------|
 | `ellipsoid.copc.laz` | ~0.6 MB | synthetic, fast smoke test (WGS84 Pseudo-Mercator) |
-| `autzen.copc.laz` | ~81 MB | real LiDAR, Autzen Stadium OR (compound CRS: NAD83 Oregon Lambert ft + NAVD88 ftUS) |
-
-Switch which sample the PoC loads via `DATA_URL` in `src/main.ts`.
+| `autzen.copc.laz` | ~81 MB | real LiDAR, Autzen Stadium OR (compound CRS: NAD83 Oregon Lambert ft + NAVD88 ftUS); single hierarchy page |
+| `sofi.copc.laz` | 2.03 GB | remote; 364M points, 111 sub-pages, no RGB — the multi-page test case |
 
 ## License
 
-TBD (planned: MIT — matches copc.js / TIFFImageryProvider).
+MIT

@@ -118,46 +118,63 @@ Cesium3DTileset
 
 ## 5. 컴포넌트 설계
 
+**현재 구현된 구조** (계획이 아니라 실제 파일):
+
 ```
-packages/pointstream3d/
-├─ src/
-│  ├─ index.ts                  # 공개 API: COPCPointCloud.fromUrl()
-│  ├─ core/
-│  │  ├─ CopcSource.ts          # copc.js 래핑: Getter(캐시/헤더/인증), 헤더·info·계층
-│  │  ├─ Hierarchy.ts           # 옥트리 계층 lazy 순회, VoxelKey↔bounds (Bounds.stepTo)
-│  │  └─ Reproject.ts           # copc.wkt → proj4 → ECEF, RTC(상대좌표) 처리
-│  ├─ tiles/
-│  │  ├─ ImplicitTileset.ts     # 가상 tileset.json + subtree availability 생성
-│  │  ├─ PntsEncoder.ts         # 디코드된 타입배열 → pnts (1차) / glTF POINTS (2차)
-│  │  └─ nodeToTile.ts          # COPC 노드 → 3D Tile 콘텐츠
-│  ├─ worker/
-│  │  ├─ sw.ts                  # Service Worker: fetch 가로채기 + 트랜스코드
-│  │  └─ decodePool.ts          # laz-perf 디코드 워커 풀(SW 내부 or 별도)
-│  ├─ render/
-│  │  ├─ CesiumRenderer.ts      # Cesium3DTileset 생성·부착, pointCloudShading/style 설정
-│  │  └─ Renderer.ts            # 렌더러 인터페이스(추상화) — A/B 교체 지점
-│  └─ options.ts                # 중첩 옵션(colorMode/pointBudget/edl/sse/requestOptions)
-├─ vite-example/                # 라이브 데모 (GitHub Pages)
-└─ package.json                 # peerDependencies: { cesium }, dep: copc, laz-perf, proj4
+src/
+├─ index.ts                 공개 진입점 (re-export만)
+├─ COPCPointCloud.ts        공개 API: fromUrl(), 옵션 타입, COPC_DEFAULTS
+├─ sw/sw.ts                 Service Worker: tileset.json / page.json / *.pnts 응답
+├─ core/
+│  ├─ CopcSource.ts         copc.js 래핑: HTTP-range Getter, 계층 로드, 노드 디코드
+│  ├─ tileset.ts            hierarchy page → 3D Tiles 청크 + external tileset (BFS 예산)
+│  ├─ bounds.ts             노드 큐브 → 실 extent 클램프 + oriented box
+│  ├─ pnts.ts               pnts 인코더 (RTC_CENTER, float32)
+│  ├─ georef.ts / ecef.ts   Cesium 비의존 재투영 + 소스 단위→미터 측정 (SW에서 동작)
+│  ├─ reproject.ts          Cesium판 재투영 (PointPrimitiveCollection PoC 전용)
+│  ├─ wkt.ts                WKT 헬퍼: 복합 CRS 추출, 피트→미터
+│  └─ lazperf.ts            laz-perf wasm URL 주입
+└─ tiles-main.ts            데모 앱 (공개 API만 사용)
 ```
 
-### 공개 API (TIFFImageryProvider 미러링)
+빌드 산출물은 셋으로 분리된다.
+
+| 산출물 | 명령 | 내용 |
+|---|---|---|
+| `dist/` (배포 패키지) | `npm run build` | `pointstream3d.js`(3 kB, cesium external) + `pointstream3d-sw.js`(460 kB 번들) + `laz-perf.wasm` + `types/` |
+| `dist-demo/` | `npm run build:demo` | 데모 사이트(`index.html`, `tiles.html`) |
+| `public/` | `npm run build:sw` | dev 서버용 SW + wasm |
+
+**클라이언트 번들이 3 kB인 이유**: copc.js·laz-perf·proj4는 전부 Service Worker 안에만 있다. 페이지 쪽 코드는 Cesium하고만 대화한다.
+
+### 공개 API
 
 ```ts
-const pc = await COPCPointCloud.fromUrl(url, {
-  requestOptions: { headers, credentials, maxRanges },
-  colorMode: 'rgb' | 'classification' | 'intensity' | 'elevation',
-  pointBudget: 3_000_000,
-  screenSpaceError: 16,
-  pointCloudShading: { attenuation: true, eyeDomeLighting: true, edlStrength: 1.0 },
+const cloud = await COPCPointCloud.fromUrl('/data/autzen.copc.laz', {
+  serviceWorker: { url, scope, register },
+  maximumScreenSpaceError: 4,
+  maxTilesPerChunk: 512,
+  pointCloudShading: { attenuation, eyeDomeLighting, geometricErrorScale, maximumAttenuation, ... },
+  cacheBytes: 512 * 1024 * 1024,
+  dynamicScreenSpaceError: false,
 });
-viewer.scene.primitives.add(pc);   // 포인트는 imagery가 아니므로 primitives/tileset로 부착
-viewer.flyTo(pc);
+viewer.scene.primitives.add(cloud.tileset);
+await viewer.zoomTo(cloud.tileset);
+cloud.destroy();   // 타일셋 파괴 + SW 측 파일 캐시 해제
 ```
 
 - **`static fromUrl()`** 비동기 팩토리 (Cesium 1.104+ 관례, TIFFImageryProvider와 동일)
 - **`cesium`은 peerDependency** — 절대 번들하지 않음
-- 내부적으로 `CesiumRenderer`가 `Cesium3DTileset.fromUrl(가상 tileset URL)`을 만들고 `pointCloudShading`·`Cesium3DTileStyle`을 설정
+- **`.tileset`은 평범한 `Cesium3DTileset`**을 그대로 노출한다. 래핑하지 않으므로 `tileset.style`·피킹·이벤트 등 Cesium 지식이 전부 그대로 적용된다. 래퍼가 존재하는 이유는 두 가지뿐 — SW 등록 생명주기, 그리고 `destroy()`(SW의 파일별 헤더·계층 캐시는 소스 URL로 키잉되어 타일셋보다 오래 살아남으므로 명시적 해제가 필요).
+- 기본값은 §8.1의 실측치. `COPC_DEFAULTS`로 export.
+
+### Service Worker scope — 배포 시 제약
+
+SW는 **자기 scope 안의 클라이언트가 낸 요청에만** fetch 이벤트를 받는다. 따라서 `pointstream3d-sw.js`는 **앱의 base path에서 서빙**되어야 한다(루트 서빙 앱이면 사이트 루트, 프로젝트 사이트면 `/앱이름/`). 더 좁은 경로에서 서빙하려면 `Service-Worker-Allowed` 헤더로 scope를 넓혀야 한다.
+
+이에 맞춰 타일 URL과 wasm 경로를 **전부 scope 상대로** 만들었다(`self.registration.scope`, `self.location`). 루트 절대경로였다면 GitHub Pages 프로젝트 사이트에서 바로 깨진다. `--base=/PointStream3D/`로 빌드해 서브패스에서 헤드리스 검증 완료 — 타일 URL이 `/PointStream3D/copc-tiles/...`로 나가고 LOD 수치는 루트 서빙과 동일.
+
+> 데모 빌드 주의: `vite-plugin-cesium`이 base를 출력 경로에 중복 적용해 Cesium 에셋을 `dist-demo/<base>/cesium/`에 복사한다(플러그인 버그). GitHub Pages 배포 시 해당 디렉터리를 끌어올리는 후처리가 필요하다.
 
 ---
 

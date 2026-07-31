@@ -1,24 +1,61 @@
 {
   "name": "pointstream3d",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "type": "module",
   "description": "Stream and render COPC point clouds directly in CesiumJS — no pre-tiling.",
+  "license": "MIT",
+  "keywords": [
+    "copc",
+    "cesium",
+    "cesiumjs",
+    "point-cloud",
+    "lidar",
+    "3d-tiles",
+    "laz",
+    "las"
+  ],
+  "sideEffects": false,
+  "main": "./dist/pointstream3d.js",
+  "module": "./dist/pointstream3d.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/pointstream3d.js"
+    },
+    "./pointstream3d-sw.js": "./dist/pointstream3d-sw.js",
+    "./laz-perf.wasm": "./dist/laz-perf.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && npm run typecheck && npm run build:lib && npm run build:types && npm run build:sw:dist",
+    "build:lib": "vite build --config vite.lib.config.ts",
+    "build:types": "tsc -p tsconfig.build.json",
+    "build:sw": "node scripts/build-sw.mjs public",
+    "build:sw:dist": "node scripts/build-sw.mjs public dist",
+    "build:demo": "npm run build:sw && vite build",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
-    "smoke": "node scripts/smoke.mjs",
-    "build:sw": "node scripts/build-sw.mjs"
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "peerDependencies": {
+    "cesium": ">=1.104.0"
   },
   "dependencies": {
-    "cesium": "^1.123.0",
     "copc": "0.0.8",
     "laz-perf": "0.0.7",
     "proj4": "^2.15.0"
   },
   "devDependencies": {
     "@types/proj4": "^2.5.5",
+    "cesium": "^1.123.0",
+    "esbuild": "^0.21.5",
     "typescript": "^5.6.3",
     "vite": "^5.4.11",
     "vite-plugin-cesium": "^1.2.23"

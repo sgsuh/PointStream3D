@@ -7,16 +7,23 @@ import { encodePnts } from '../core/pnts';
 
 // Service Worker that transcodes a COPC file into 3D Tiles on the fly, one
 // hierarchy page at a time (external tilesets) so it scales to huge files:
-//   GET /copc-tiles/tileset.json?src=<url>              -> root chunk
-//   GET /copc-tiles/page.json?src=<url>&key=&o=&l=      -> a sub-page chunk (external tileset)
-//   GET /copc-tiles/<l-x-y-z>.pnts?src=<url>&o=&l=&c=   -> one node as `pnts`
+//   GET <scope>copc-tiles/tileset.json?src=<url>            -> root chunk
+//   GET <scope>copc-tiles/page.json?src=<url>&key=&o=&l=    -> a sub-page chunk (external tileset)
+//   GET <scope>copc-tiles/<l-x-y-z>.pnts?src=<url>&o=&l=&c= -> one node as `pnts`
 // Cesium's Cesium3DTileset drives LOD/culling/memory and applies point-cloud
 // shading (EDL) to our tiles for free.
 
 declare const self: ServiceWorkerGlobalScope;
 
-const WASM_URL = '/laz-perf.wasm';
-const PREFIX = '/copc-tiles/';
+// Everything is addressed relative to the registration scope rather than the
+// site root, so the library also works when the app is served under a base path
+// (a GitHub Pages project site, say). A Service Worker only receives fetch
+// events from clients inside its scope, so that scope has to cover the page —
+// serve this file from the app's base path, or widen it with the
+// `Service-Worker-Allowed` header.
+const PREFIX = new URL('copc-tiles/', self.registration.scope).pathname;
+// The wasm is expected next to this script.
+const WASM_URL = new URL('laz-perf.wasm', self.location.href).href;
 // Tiles emitted per external tileset, overridable with `?mt=`.
 //
 // Every artificial split costs a round trip before Cesium may refine deeper, so
@@ -63,6 +70,18 @@ function getPage(source: CopcSource, src: string, page: Hierarchy.Page): Promise
   }
   return p;
 }
+
+// A page releases a file's metadata and parsed hierarchy pages when its point
+// cloud is destroyed. Nothing else evicts them: they are keyed by source URL and
+// live as long as the worker does.
+self.addEventListener('message', (event) => {
+  const data = event.data as { type?: string; src?: string } | undefined;
+  if (data?.type !== 'pointstream3d:release' || !data.src) return;
+  metaCache.delete(data.src);
+  for (const key of [...pageCache.keys()]) {
+    if (key.startsWith(`${data.src}|`)) pageCache.delete(key);
+  }
+});
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);

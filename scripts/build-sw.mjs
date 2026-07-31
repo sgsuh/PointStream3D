@@ -1,8 +1,15 @@
 // Bundle the Service Worker (copc.js + laz-perf + proj4 + our encoders) into a
-// single ESM file at public/copc-sw.js, and copy the laz-perf wasm next to it.
+// single ESM file, and copy the laz-perf wasm next to it — the worker resolves
+// the wasm relative to its own URL, so the two must stay siblings.
+//
+//   node scripts/build-sw.mjs [outdir...]     (default: public)
+//
 // Run in the container:  docker compose run --rm web npm run build:sw
 import { build } from 'esbuild';
-import { copyFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync } from 'node:fs';
+
+const outDirs = process.argv.slice(2);
+if (outDirs.length === 0) outDirs.push('public');
 
 // copc.js references Node built-ins (fs) on code paths we never hit in the SW
 // (we pass our own HTTP Getter). Stub them so a browser bundle resolves.
@@ -19,16 +26,18 @@ const stubNodeBuiltins = {
   },
 };
 
-await build({
-  entryPoints: ['src/sw/sw.ts'],
-  bundle: true,
-  format: 'esm',
-  platform: 'browser',
-  target: 'es2020',
-  outfile: 'public/copc-sw.js',
-  plugins: [stubNodeBuiltins],
-  logLevel: 'info',
-});
-
-copyFileSync('node_modules/laz-perf/lib/web/laz-perf.wasm', 'public/laz-perf.wasm');
-console.log('SW bundled -> public/copc-sw.js ; wasm -> public/laz-perf.wasm');
+for (const outDir of outDirs) {
+  mkdirSync(outDir, { recursive: true });
+  await build({
+    entryPoints: ['src/sw/sw.ts'],
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    target: 'es2020',
+    outfile: `${outDir}/pointstream3d-sw.js`,
+    plugins: [stubNodeBuiltins],
+    logLevel: 'info',
+  });
+  copyFileSync('node_modules/laz-perf/lib/web/laz-perf.wasm', `${outDir}/laz-perf.wasm`);
+  console.log(`SW bundled -> ${outDir}/pointstream3d-sw.js ; wasm -> ${outDir}/laz-perf.wasm`);
+}

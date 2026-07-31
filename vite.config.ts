@@ -1,8 +1,19 @@
 import { defineConfig } from 'vite';
 import cesium from 'vite-plugin-cesium';
 
+// Dev server and demo-site build. The library itself is built by
+// vite.lib.config.ts — this config only covers the two demo pages.
 export default defineConfig({
   plugins: [cesium()],
+  build: {
+    // Kept out of dist/, which is the publishable package.
+    outDir: 'dist-demo',
+    rollupOptions: {
+      // tiles.html is the real demo; index.html is the PointPrimitiveCollection
+      // PoC that proved the data pipeline.
+      input: { index: 'index.html', tiles: 'tiles.html' },
+    },
+  },
   server: {
     host: '0.0.0.0',
     port: 5173,

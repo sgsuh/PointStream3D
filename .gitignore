@@ -9,6 +9,8 @@ public/data/*.laz
 # Headless render screenshots
 poc-out
 # Generated Service Worker bundle + copied wasm
-public/copc-sw.js
-public/copc-sw.js.map
+public/pointstream3d-sw.js
+public/pointstream3d-sw.js.map
 public/laz-perf.wasm
+# Built demo site
+dist-demo

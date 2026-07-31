@@ -196,10 +196,87 @@ viewer.flyTo(pc);
 ## 8. 렌더링 품질 (A 채택으로 대부분 무료)
 
 - **EDL**: `tileset.pointCloudShading = { attenuation: true, eyeDomeLighting: true, eyeDomeLightingStrength, eyeDomeLightingRadius }`. **주의: `eyeDomeLighting`은 `attenuation: true`일 때만 실제 동작.** WebGL2(Cesium 기본)에서 바로 작동.
-- **포인트 크기 감쇠**: geometric-error 기반 자동. 우리는 노드 spacing → geometricError를 tileset에 정확히 매핑하면 됨.
+- **포인트 크기 감쇠**: geometric-error 기반 자동. 우리는 노드 spacing → geometricError를 tileset에 정확히 매핑하면 됨. → **§8.1에서 완료(단위 버그 포함)**.
 - **컬러 모드**: `Cesium3DTileStyle`로 런타임 전환 — RGB / `${Intensity}` / `${Classification}` / `${POSITION}[2]`(고도 램프). GPU 표현식이라 셰이더 작성 불필요.
 - **포인트 버짓**: `maximumScreenSpaceError` + `cacheBytes`로 Potree식 버짓 근사.
-- **LOD 팝핑 완화**: SSE 기반 크기 전환 + Cesium의 타일 페이드. (pnts는 replacement refinement가 기본이고 EDL도 여기서 최적.)
+- **LOD refinement**: 우리는 `refine: "ADD"` 사용 — 포인트 클라우드는 자식 노드가 부모를 대체하지 않고 **디테일을 누적**하는 구조라 COPC 옥트리 의미와 일치하고, 팝핑도 REPLACE보다 덜하다(기존 점이 사라지지 않고 점만 추가됨).
+
+---
+
+### 8.1 LOD 품질 튜닝 (Week 1) — 측정 로그
+
+모두 Docker + 헤드리스(Puppeteer)로 측정. `scripts/screenshot.mjs`가 `Cesium3DTileset.statistics`를 덤프한다.
+바운딩 볼륨을 바꾸면 `zoomTo()` 프레이밍이 같이 바뀌므로, A/B는 **`?cam=`으로 카메라를 고정**해야 유효하다.
+
+#### 고친 것 1 — `geometricError` 단위 버그 (가장 큰 원인)
+
+COPC `spacing`은 **소스 CRS 단위**인데 3D Tiles `geometricError`는 **미터** 정의다. autzen은 피트 좌표계(`spacing = 36.37`)라 GE가 **3.28배 과대**였다. Cesium은 GE를 **LOD 선택과 포인트 감쇠 크기 양쪽**에 쓰므로 오차가 두 번 나타난다.
+
+WKT 단위를 파싱하는 대신 **재투영을 통해 직접 측정**한다(`metresPerSourceUnit`, `src/core/georef.ts`). 이렇게 하면 피트/미터뿐 아니라 **투영 스케일 왜곡**(Web Mercator는 위도에 따라 1/cos(lat)로 커짐)과 **지리좌표계(도 단위)**까지 한 번에 흡수된다.
+
+#### 고친 것 2 — 큐브 바운딩 구 → 타이트한 oriented box
+
+COPC 옥트리 노드 범위는 **정육면체**지만 실제 LiDAR는 얇은 판이다. `scripts/probe-copc.mjs`로 측정한 autzen: 데이터 `3426 × 4656 × 209`(소스 단위) vs 큐브 한 변 `4655` → **부피 30.25배, 반지름 1.39배 과대 포함**.
+
+이게 두 곳에서 손해였다. ① 프러스텀 컬링이 시야 밖 타일을 못 버림, ② **SSE가 바운딩 볼륨까지의 거리로 계산**되는데 카메라가 볼륨 *안*에 들어가면 거리 0 → SSE 무한 → 최대 refine 강제. 각 노드를 **파일 실제 extent로 클램프**하고 `sphere` 대신 **oriented `box`**를 emit하도록 변경(`src/core/bounds.ts`).
+
+#### 결과 — autzen, 동일 카메라 고정 (`sse=4`)
+
+| 지표 | before | after | |
+|---|---:|---:|---|
+| 선택 포인트 | 1,291,829 | **181,525** | **7.1× ↓** |
+| 선택 타일 | 44 | **6** | |
+| 순회 타일(visited) | 74 | **6** | 컬링이 실제로 걸림 |
+| GPU 지오메트리 | 19.4 MB | **2.7 MB** | **7.1× ↓** |
+| 전체 로드 시간 | 4,116 ms | **1,341 ms** | |
+| 외부 타일셋 요청 | 30 | **0** | |
+| 루트 바운딩 반지름 | 1,229 m | **908 m** | |
+
+같은 화면을 **7배 적은 포인트로** 렌더한다(스크린샷 육안 비교 시 동등). before가 과했던 것이지 after가 덜 그리는 게 아니다.
+
+#### 고친 것 3 — 외부 타일셋 분할: 옥트리 깊이 → **타일 개수 예산**
+
+기존 `CHUNK_LEVELS=2`는 2레벨마다 인위적 외부 타일셋 경계를 만들어, 깊이 refine할 때마다 순차 왕복이 필요했다. 그런데 **페이지 크기는 파일마다 천차만별**이다 — autzen은 전체 하이어라키가 단일 페이지 278노드, sofi는 루트 페이지 하나가 2710노드.
+
+고정 깊이로는 양쪽을 못 맞춘다(깊이 무제한 시 sofi 루트 문서가 **1.08 MB**). 그래서 **BFS + 타일 개수 예산**(`maxTilesPerChunk`, 기본 512)으로 바꿨다. BFS라 청크가 한 갈래 깊은 가지 대신 얕은 레벨을 온전히 담는다. 예산 소진 시 큐에 남은 타일을 external tileset 참조로 **제자리 전환**한다 — 예산이 inline 타일만 세면 잘린 프론티어의 external 항목이 그대로 남아 문서가 안 줄어든다(실측: 2209항목/894 KB).
+
+| | autzen | sofi |
+|---|---:|---:|
+| 루트 페이지 노드 수 | 278 | 2,710 |
+| 루트 문서 (깊이 무제한) | 107 KB | 1,081 KB |
+| 루트 문서 (`mt=512`) | **107 KB**(단일 문서 유지) | **208 KB** (5.2× ↓) |
+
+#### 고친 것 4 — attenuation 배율로 구멍 메우기
+
+GE를 정확히 고치니 `sse=8`에서 배경이 비치는 **구멍**이 생겼다. 포인트는 사각 splat인데 실제 분포는 불규칙해서, 크기를 spacing과 정확히 같게 잡으면 틈이 남는다. `pointCloudShading.geometricErrorScale`을 **1.5**로 올리면 구멍이 사라진다(`ges=1.0` 대비 스크린샷에서 확인, 포인트 수는 동일 — 렌더링만 영향).
+
+#### `maximumScreenSpaceError` 스윕 (autzen, 근접 카메라 511 m)
+
+| sse | 선택 포인트 | 타일 | GPU | 로드 | 화질 |
+|---:|---:|---:|---:|---:|---|
+| 2 | 4,142,444 | 101 | 62.1 MB | 9,534 ms | 과잉 |
+| **4** | **1,178,906** | **33** | **17.7 MB** | **3,097 ms** | **기본값** |
+| 8 | 494,215 | 13 | 7.4 MB | 1,747 ms | `ges=1.5`면 연속, 약간 소프트 |
+| 16 | 230,562 | 6 | 3.5 MB | 1,543 ms | 지나치게 성김 |
+
+#### 확정 기본값
+
+| 값 | 기본 | 쿼리 | 근거 |
+|---|---:|---|---|
+| `maximumScreenSpaceError` | 4 | `?sse=` | 위 스윕. Cesium 기본 16은 포인트 클라우드엔 과하게 성김 |
+| `geometricErrorScale` | 1.5 | `?ges=` | 1.0은 구멍 발생, 2.0은 뭉개짐 |
+| `maximumAttenuation` | 8 px | `?maxatt=` | 근접 시 블롭화 방지 |
+| `cacheBytes` / overflow | 512 MB | `?cache=` | 임의 크기 파일에서 메모리 상한 |
+| `maxTilesPerChunk` | 512 | `?mt=` | 위 표 |
+| `dynamicScreenSpaceError` | **off** | `?dyn=1` | autzen의 사선·수평선 뷰 **양쪽에서 측정상 무변화**라 켤 근거 없음(Cesium 기본도 false). 뷰보다 훨씬 큰 데이터셋에서만 의미 |
+
+#### 대용량 회귀 검증 — sofi (2.03 GB, 364M pts, sub-page 111개)
+
+근접 카메라(`?zoom=0.05`)에서 **실제 COPC sub-page 21개**를 lazy 로드(외부 타일셋 22, pnts 143, 2.95M 포인트, 35.4 MB). 2 GB 파일을 range 스트리밍하며 동작. RGB가 없어 회색+EDL로 표시되고, 수면은 LiDAR 반사가 없어 비는 것이 정상.
+
+예산 경계에서 잘린 노드 중 **자식이 없는 리프는 전환하지 않는다** — 이미 갖고 있는 타일 하나를 받으려 왕복을 쓰기 때문. 이 처리로 sofi 외부 타일셋 요청이 28 → **22**로 줄었고 출력은 동일했다.
+
+> 주의: 개요 카메라에서는 refine이 루트 청크(513타일) 안에서 끝나 `page.json` 요청이 0이다. 이는 lazy 로딩이 의도대로 동작하는 것이지 회귀가 아니다 — sub-page 경로 검증은 반드시 근접 카메라로 해야 한다.
 
 ---
 

@@ -17,9 +17,13 @@ declare const self: ServiceWorkerGlobalScope;
 
 const WASM_URL = '/laz-perf.wasm';
 const PREFIX = '/copc-tiles/';
-// Octree levels per external-tileset chunk. Bounds each response's size and,
-// on single-page files, still exercises the external-tileset lazy path.
-const CHUNK_LEVELS = 2;
+// Tiles emitted per external tileset, overridable with `?mt=`.
+//
+// Every artificial split costs a round trip before Cesium may refine deeper, so
+// we want chunks as large as stays cheap to generate and parse: 512 tiles keeps
+// autzen's 278-node hierarchy in a single ~100 kB document, while sofi's
+// 2710-node root page is cut from 1.08 MB into lazily-loaded pieces.
+const DEFAULT_MAX_TILES_PER_CHUNK = 512;
 
 self.addEventListener('install', () => {
   self.skipWaiting();
@@ -67,11 +71,11 @@ self.addEventListener('fetch', (event) => {
   if (!src) return;
 
   if (url.pathname === `${PREFIX}tileset.json`) {
-    event.respondWith(serveChunk(src, '0-0-0-0', null));
+    event.respondWith(serveChunk(src, '0-0-0-0', null, maxTilesFrom(url)));
   } else if (url.pathname === `${PREFIX}page.json`) {
     const key = url.searchParams.get('key')!;
     const page = pageFromParams(url);
-    event.respondWith(serveChunk(src, key, page));
+    event.respondWith(serveChunk(src, key, page, maxTilesFrom(url)));
   } else if (url.pathname.endsWith('.pnts')) {
     event.respondWith(serveTile(src, url));
   }
@@ -84,7 +88,19 @@ function pageFromParams(url: URL): Hierarchy.Page {
   };
 }
 
-async function serveChunk(src: string, rootKey: string, page: Hierarchy.Page | null): Promise<Response> {
+function maxTilesFrom(url: URL): number {
+  const mt = Number(url.searchParams.get('mt'));
+  // Below one octree level's worth of children a chunk carries almost no
+  // hierarchy, so the walk would cost a round trip per level.
+  return Number.isFinite(mt) && mt >= 9 ? mt : DEFAULT_MAX_TILES_PER_CHUNK;
+}
+
+async function serveChunk(
+  src: string,
+  rootKey: string,
+  page: Hierarchy.Page | null,
+  maxTilesPerChunk: number,
+): Promise<Response> {
   try {
     const { source, toEcef } = await getMeta(src);
     const pageRef = page ?? source.copc.info.rootHierarchyPage;
@@ -92,7 +108,7 @@ async function serveChunk(src: string, rootKey: string, page: Hierarchy.Page | n
     const tileset = buildPageTileset(source.copc, nodes, pages, toEcef, {
       src,
       rootKey,
-      chunkLevels: CHUNK_LEVELS,
+      maxTilesPerChunk,
       fallbackPage: pageRef,
     });
     return json(tileset);

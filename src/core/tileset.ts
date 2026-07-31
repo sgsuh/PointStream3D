@@ -11,6 +11,10 @@ export interface PageTilesetOptions {
   maxTilesPerChunk: number;
   /** Page ref to reload for a chunk-boundary external tileset (the page these nodes came from). */
   fallbackPage: Hierarchy.Page;
+  /** Comma-separated per-point attributes to encode, forwarded to tile requests. */
+  attributes?: string;
+  /** Published on `asset.extras` of this document; Cesium keeps it on `tileset.asset`. */
+  extras?: unknown;
 }
 
 /**
@@ -54,6 +58,10 @@ export function buildPageTileset(
     return orientedBox(clampToData(cube, copc.header.min, copc.header.max), toEcef);
   };
 
+  // Present only when attributes were requested, so URLs stay unchanged (and
+  // caches stay warm) for the common colour-only case.
+  const attrParam: Record<string, string> = opts.attributes ? { a: opts.attributes } : {};
+
   const pageUri = (childKey: string, page: Hierarchy.Page) =>
     `page.json?${query({
       src: opts.src,
@@ -61,6 +69,7 @@ export function buildPageTileset(
       o: page.pageOffset,
       l: page.pageLength,
       mt: opts.maxTilesPerChunk,
+      ...attrParam,
     })}`;
 
   const externalTile = (childKey: string, page: Hierarchy.Page): Record<string, unknown> => ({
@@ -79,7 +88,13 @@ export function buildPageTileset(
     };
     if (node && node.pointCount > 0) {
       tile.content = {
-        uri: `${key}.pnts?${query({ src: opts.src, o: node.pointDataOffset, l: node.pointDataLength, c: node.pointCount })}`,
+        uri: `${key}.pnts?${query({
+          src: opts.src,
+          o: node.pointDataOffset,
+          l: node.pointDataLength,
+          c: node.pointCount,
+          ...attrParam,
+        })}`,
       };
     }
     return tile;
@@ -141,7 +156,7 @@ export function buildPageTileset(
   }
 
   return {
-    asset: { version: '1.0' },
+    asset: opts.extras ? { version: '1.0', extras: opts.extras } : { version: '1.0' },
     geometricError: geometricError(rootLevel),
     root,
   };

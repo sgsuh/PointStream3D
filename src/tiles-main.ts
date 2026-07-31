@@ -9,7 +9,9 @@ import {
   Math as CesiumMath,
 } from 'cesium';
 import 'cesium/Build/Cesium/Widgets/widgets.css';
-import { COPCPointCloud, COPC_DEFAULTS } from './index';
+import { COPCPointCloud, COPC_DEFAULTS, type COPCColorMode } from './index';
+
+const COLOR_MODES: COPCColorMode[] = ['rgb', 'elevation', 'intensity', 'classification'];
 
 // Everything is query-configurable so the headless harness can A/B one knob at
 // a time:  tiles.html?src=/remote-s3/hobu-lidar/sofi.copc.laz&sse=8
@@ -23,6 +25,7 @@ const MAX_SSE = Number(params.get('sse') ?? String(COPC_DEFAULTS.maximumScreenSp
 // zoomTo() depends on the root bounding volume, so LOD A/B runs must pin the
 // camera instead — otherwise a bounding-volume change silently reframes the shot.
 const CAM = params.get('cam');
+const COLOR = params.get('color') as COPCColorMode | null;
 const num = (key: string, fallback: number) => Number(params.get(key) ?? String(fallback));
 
 const statusEl = document.getElementById('status')!;
@@ -30,6 +33,30 @@ const setStatus = (m: string) => {
   statusEl.textContent = m;
   console.log('[PointStream3D/tiles]', m);
 };
+
+// Runtime colour switching: assigning colorMode only swaps the GPU style, so no
+// tile is refetched. `rgb` is offered only when the file actually has colour.
+function buildColorSwitcher(cloud: COPCPointCloud): void {
+  const host = document.getElementById('colorModes')!;
+  const buttons = new Map<COPCColorMode, HTMLButtonElement>();
+  const refresh = () => {
+    for (const [mode, button] of buttons) {
+      button.classList.toggle('active', cloud.colorMode === mode);
+    }
+  };
+  for (const mode of COLOR_MODES) {
+    if (mode === 'rgb' && cloud.hasColor === false) continue;
+    const button = document.createElement('button');
+    button.textContent = mode;
+    button.onclick = () => {
+      cloud.colorMode = mode;
+      refresh();
+    };
+    buttons.set(mode, button);
+    host.appendChild(button);
+  }
+  refresh();
+}
 
 async function main() {
   const viewer = new Viewer('cesiumContainer', {
@@ -53,6 +80,10 @@ async function main() {
     // serviceWorker.url is left at its default — `pointstream3d-sw.js` next to
     // the document base — which is what makes this work under a base path too.
     maximumScreenSpaceError: MAX_SSE,
+    ...(COLOR ? { colorMode: COLOR } : {}),
+    // Carry every attribute so the switcher can change mode without refetching.
+    // `?attrs=0` drops them, for measuring what that costs.
+    attributes: params.get('attrs') === '0' ? [] : ['intensity', 'classification', 'height'],
     maxTilesPerChunk: num('mt', COPC_DEFAULTS.maxTilesPerChunk),
     cacheBytes: num('cache', COPC_DEFAULTS.cacheBytes / (1024 * 1024)) * 1024 * 1024,
     dynamicScreenSpaceError: params.get('dyn') === '1',
@@ -66,6 +97,7 @@ async function main() {
 
   const { tileset } = cloud;
   viewer.scene.primitives.add(tileset);
+  buildColorSwitcher(cloud);
   if (CAM) {
     const [lon, lat, height, heading, pitch] = CAM.split(',').map(Number);
     viewer.camera.setView({
@@ -115,6 +147,9 @@ async function main() {
         tilesTotal: s.numberOfTilesTotal ?? null,
         tilesWithContentReady: s.numberOfTilesWithContentReady ?? null,
         geometryBytes: s.geometryByteLength ?? null,
+        colorMode: cloud.colorMode,
+        hasColor: cloud.hasColor,
+        attributes: cloud.attributes.join(',') || null,
         maximumScreenSpaceError: tileset.maximumScreenSpaceError,
         geometricErrorScale: tileset.pointCloudShading.geometricErrorScale,
         maximumAttenuation: tileset.pointCloudShading.maximumAttenuation,

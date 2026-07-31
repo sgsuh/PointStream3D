@@ -10,3 +10,10 @@ export {
   type COPCPointCloudShadingOptions,
   type COPCServiceWorkerOptions,
 } from './COPCPointCloud';
+export {
+  buildColorStyle,
+  COLOR_MODE_ATTRIBUTE,
+  type COPCColorMode,
+  type COPCStyleRanges,
+} from './styles';
+export type { COPCAttribute } from './core/CopcSource';

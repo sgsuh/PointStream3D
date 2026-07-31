@@ -71,6 +71,41 @@ await viewer.zoomTo(cloud.tileset);
 Call `cloud.destroy()` when you're done: it destroys the tileset and tells the worker to
 drop its cached header and hierarchy pages for that file, which nothing else evicts.
 
+### Colour modes
+
+```ts
+const cloud = await COPCPointCloud.fromUrl(url, {
+  colorMode: 'rgb',
+  attributes: ['height', 'intensity', 'classification'], // carry these for later
+});
+
+cloud.colorMode = 'elevation'; // instant — no tiles refetched
+```
+
+| mode | needs attribute | notes |
+|---|---|---|
+| `rgb` | — | the file's own colour; no style at all |
+| `elevation` | `height` | auto-ranged from the file's header |
+| `intensity` | `intensity` | auto-ranged from the root node, since LAS has no header field for it |
+| `classification` | `classification` | ASPRS standard classes (LAS 1.4) |
+
+`colorMode` defaults to `rgb` when the file carries colour and `elevation` when it does
+not, so a file with no RGB renders usefully out of the box.
+
+Styling runs on the GPU from a per-point batch table, so **switching mode refetches
+nothing** — verified by `scripts/smoke-colormode.mjs`. The catch is that a mode's attribute
+has to be present in the tiles: `fromUrl` requests whatever the initial `colorMode` needs,
+so list any mode you might switch to in `attributes` up front. Switching to a mode whose
+attribute is missing throws rather than rendering silently wrong.
+
+Attributes cost bytes per point — `height` 4, `intensity` 2, `classification` 1, against 15
+for position and colour. Carrying all three grew autzen's loaded geometry from 17.7 MB to
+25.9 MB (+47%) at the same camera, so request only the modes you actually offer.
+
+Elevation is coloured from an explicit `Height` property rather than the point's position
+because the styling language's `${POSITION}` is tile-local, and every tile carries its own
+`RTC_CENTER` — a ramp built on it would restart at each tile boundary.
+
 ### Options
 
 ```ts
@@ -85,6 +120,8 @@ const cloud = await COPCPointCloud.fromUrl(url, {
 | option | default | notes |
 |---|---:|---|
 | `serviceWorker.url` | `pointstream3d-sw.js` next to the document base | set `register: false` if your app registers it |
+| `colorMode` | `rgb`, or `elevation` with no RGB | see above |
+| `attributes` | what `colorMode` needs | extra per-point attributes to carry for later switching |
 | `maximumScreenSpaceError` | `4` | pixels of allowed error before a tile refines |
 | `maxTilesPerChunk` | `512` | tiles per generated tileset document before deeper nodes are delegated |
 | `pointCloudShading.attenuation` | `true` | required for eye-dome lighting to do anything |
@@ -153,8 +190,19 @@ docker run --rm --network pointstream3d_default \
   ghcr.io/puppeteer/puppeteer:latest screenshot.mjs
 ```
 
+Check that colour-mode switching refetches nothing:
+
+```bash
+docker run --rm --network pointstream3d_default \
+  -e TARGET_URL="http://web:5173/tiles.html" \
+  -v "$PWD/scripts:/home/pptruser/work:ro" \
+  -w /home/pptruser/work --entrypoint node \
+  ghcr.io/puppeteer/puppeteer:latest smoke-colormode.mjs
+```
+
 The demo exposes every LOD knob as a query parameter (`?sse=`, `?ges=`, `?mt=`, `?cache=`,
-`?dyn=`), plus `?cam=lon,lat,height,heading,pitch`. **Pin `?cam=` for any A/B run** —
+`?dyn=`), plus `?color=` and `?attrs=0` (drop per-point attributes, to measure their cost)
+and `?cam=lon,lat,height,heading,pitch`. **Pin `?cam=` for any A/B run** —
 `zoomTo()` frames from the root bounding volume, so changing a bounding volume silently
 reframes the shot and invalidates the comparison. `screenshot.mjs` prints a reusable `cam`
 string.

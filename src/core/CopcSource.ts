@@ -18,6 +18,13 @@ export function httpRangeGetter(url: string): Getter {
   };
 }
 
+/**
+ * Optional per-point LAS dimensions to decode alongside position and colour.
+ * `height` is not a LAS dimension — it is Z converted to metres, and is added by
+ * the caller that knows the CRS.
+ */
+export type COPCAttribute = 'intensity' | 'classification' | 'height';
+
 export interface DecodedNode {
   key: string;
   pointCount: number;
@@ -25,6 +32,10 @@ export interface DecodedNode {
   positions: Float64Array;
   /** RGB triples 0-255, if the file carries color. */
   colors?: Uint8Array;
+  /** Raw LAS intensity, if requested and present. */
+  intensity?: Uint16Array;
+  /** ASPRS classification code, if requested and present. */
+  classification?: Uint8Array;
   /** [minx, miny, minz, maxx, maxy, maxz] in the source CRS. */
   bounds: number[];
 }
@@ -55,7 +66,11 @@ export class CopcSource {
   }
 
   /** Fetch + LAZ-decode one node into typed arrays. */
-  async decodeNode(key: string, node: Hierarchy.Node): Promise<DecodedNode> {
+  async decodeNode(
+    key: string,
+    node: Hierarchy.Node,
+    attributes: readonly COPCAttribute[] = [],
+  ): Promise<DecodedNode> {
     const view = await Copc.loadPointDataView(this.getter, this.copc, node, {
       lazPerf: await getLazPerf(this.lazPerfWasmUrl),
     });
@@ -93,6 +108,30 @@ export class CopcSource {
       }
     }
 
-    return { key, pointCount: n, positions, colors, bounds: this.boundsOf(key) };
+    // Optional per-point dimensions. Point formats differ in what they carry, so
+    // each is emitted only when the file actually has it.
+    let intensity: Uint16Array | undefined;
+    if (attributes.includes('intensity') && view.dimensions.Intensity) {
+      const g = view.getter('Intensity');
+      intensity = new Uint16Array(n);
+      for (let i = 0; i < n; i++) intensity[i] = g(i);
+    }
+
+    let classification: Uint8Array | undefined;
+    if (attributes.includes('classification') && view.dimensions.Classification) {
+      const g = view.getter('Classification');
+      classification = new Uint8Array(n);
+      for (let i = 0; i < n; i++) classification[i] = g(i);
+    }
+
+    return {
+      key,
+      pointCount: n,
+      positions,
+      colors,
+      intensity,
+      classification,
+      bounds: this.boundsOf(key),
+    };
   }
 }

@@ -26,11 +26,37 @@
         border-radius: 6px;
         max-width: 72vw;
       }
+      #colorModes {
+        position: absolute;
+        top: 52px;
+        left: 10px;
+        z-index: 10;
+        display: flex;
+        gap: 6px;
+      }
+      #colorModes button {
+        background: rgba(11, 16, 33, 0.85);
+        color: #cfe3ff;
+        border: 1px solid #2b3a5c;
+        border-radius: 6px;
+        padding: 5px 10px;
+        font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+        cursor: pointer;
+      }
+      #colorModes button:hover {
+        border-color: #4d6da3;
+      }
+      #colorModes button.active {
+        background: #2f6fd0;
+        color: #fff;
+        border-color: #2f6fd0;
+      }
     </style>
   </head>
   <body>
     <div id="cesiumContainer"></div>
     <div id="status">PointStream3D (3D Tiles) — booting…</div>
+    <div id="colorModes"></div>
     <script type="module" src="/src/tiles-main.ts"></script>
   </body>
 </html>

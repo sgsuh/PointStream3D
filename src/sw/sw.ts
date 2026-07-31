@@ -1,9 +1,10 @@
 /// <reference lib="webworker" />
 import type { Hierarchy } from 'copc';
-import { CopcSource } from '../core/CopcSource';
+import { CopcSource, type COPCAttribute } from '../core/CopcSource';
 import { makeToEcefArr, type ToEcefArr } from '../core/georef';
 import { buildPageTileset } from '../core/tileset';
-import { encodePnts } from '../core/pnts';
+import { encodePnts, type BatchArray } from '../core/pnts';
+import { verticalMetreFactor } from '../core/wkt';
 
 // Service Worker that transcodes a COPC file into 3D Tiles on the fly, one
 // hierarchy page at a time (external tilesets) so it scales to huge files:
@@ -42,6 +43,8 @@ self.addEventListener('activate', (event) => {
 interface Meta {
   source: CopcSource;
   toEcef: ToEcefArr;
+  /** Source vertical unit -> metre, so `Height` means the same across files. */
+  heightScale: number;
 }
 
 // Immutable per-file metadata (header + CRS). Everything else is addressed
@@ -52,11 +55,51 @@ function getMeta(src: string): Promise<Meta> {
   if (!m) {
     m = (async () => {
       const source = await CopcSource.fromUrl(src, WASM_URL);
-      return { source, toEcef: makeToEcefArr(source.copc.wkt) };
+      const wkt = source.copc.wkt;
+      return {
+        source,
+        toEcef: makeToEcefArr(wkt),
+        // With no CRS the data is already lon/lat/height in metres.
+        heightScale: wkt ? verticalMetreFactor(wkt) : 1,
+      };
     })();
     metaCache.set(src, m);
   }
   return m;
+}
+
+const ATTRIBUTES: readonly COPCAttribute[] = ['intensity', 'classification', 'height'];
+
+function attributesFrom(url: URL): COPCAttribute[] {
+  const raw = url.searchParams.get('a');
+  if (!raw) return [];
+  return raw.split(',').filter((a): a is COPCAttribute => (ATTRIBUTES as readonly string[]).includes(a));
+}
+
+// LAS has no header field for the intensity range, and a ramp needs one, so it
+// is measured from the root node — the one node every viewer loads anyway.
+const intensityRangeCache = new Map<string, Promise<[number, number] | null>>();
+function getIntensityRange(src: string): Promise<[number, number] | null> {
+  let r = intensityRangeCache.get(src);
+  if (!r) {
+    r = (async () => {
+      const { source } = await getMeta(src);
+      const { nodes } = await getPage(source, src, source.copc.info.rootHierarchyPage);
+      const root = nodes['0-0-0-0'];
+      if (!root || root.pointCount <= 0) return null;
+      const { intensity } = await source.decodeNode('0-0-0-0', root, ['intensity']);
+      if (!intensity?.length) return null;
+      let min = Infinity;
+      let max = -Infinity;
+      for (const v of intensity) {
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+      return [min, max] as [number, number];
+    })().catch(() => null);
+    intensityRangeCache.set(src, r);
+  }
+  return r;
 }
 
 // Parsed hierarchy pages, keyed by (src, offset, length).
@@ -89,12 +132,21 @@ self.addEventListener('fetch', (event) => {
   const src = url.searchParams.get('src');
   if (!src) return;
 
-  if (url.pathname === `${PREFIX}tileset.json`) {
-    event.respondWith(serveChunk(src, '0-0-0-0', null, maxTilesFrom(url)));
+  if (url.pathname === `${PREFIX}info.json`) {
+    // Header-only metadata, so the client can pick a default colour mode before
+    // it commits to a tileset URL (which encodes the attribute set).
+    event.respondWith(
+      getMeta(src)
+        .then(() => rootExtras(src, attributesFrom(url)))
+        .then((extras) => json(extras.pointstream3d))
+        .catch((e: Error) => new Response(`info error: ${e.message}`, { status: 500 })),
+    );
+  } else if (url.pathname === `${PREFIX}tileset.json`) {
+    event.respondWith(serveChunk(src, '0-0-0-0', null, maxTilesFrom(url), attributesFrom(url)));
   } else if (url.pathname === `${PREFIX}page.json`) {
     const key = url.searchParams.get('key')!;
     const page = pageFromParams(url);
-    event.respondWith(serveChunk(src, key, page, maxTilesFrom(url)));
+    event.respondWith(serveChunk(src, key, page, maxTilesFrom(url), attributesFrom(url)));
   } else if (url.pathname.endsWith('.pnts')) {
     event.respondWith(serveTile(src, url));
   }
@@ -119,6 +171,7 @@ async function serveChunk(
   rootKey: string,
   page: Hierarchy.Page | null,
   maxTilesPerChunk: number,
+  attributes: COPCAttribute[],
 ): Promise<Response> {
   try {
     const { source, toEcef } = await getMeta(src);
@@ -129,6 +182,10 @@ async function serveChunk(
       rootKey,
       maxTilesPerChunk,
       fallbackPage: pageRef,
+      attributes: attributes.join(',') || undefined,
+      // Only the root document is read for metadata; the ranges a colour ramp
+      // needs are known here and nowhere on the client.
+      extras: page ? undefined : await rootExtras(src, attributes),
     });
     return json(tileset);
   } catch (e) {
@@ -136,9 +193,25 @@ async function serveChunk(
   }
 }
 
+/** Metadata the client cannot derive, published on the root document's asset. */
+async function rootExtras(src: string, attributes: COPCAttribute[]) {
+  const { source, heightScale } = await getMeta(src);
+  const { header } = source.copc;
+  return {
+    pointstream3d: {
+      pointCount: header.pointCount,
+      // LAS point formats carrying RGB. Note 6 does not — sofi is format 6.
+      hasColor: [2, 3, 5, 7, 8, 10].includes(header.pointDataRecordFormat),
+      heightRange: [header.min[2] * heightScale, header.max[2] * heightScale],
+      intensityRange: attributes.includes('intensity') ? await getIntensityRange(src) : null,
+    },
+  };
+}
+
 async function serveTile(src: string, url: URL): Promise<Response> {
   try {
-    const { source, toEcef } = await getMeta(src);
+    const { source, toEcef, heightScale } = await getMeta(src);
+    const attributes = attributesFrom(url);
     const key = url.pathname.slice(PREFIX.length, -'.pnts'.length);
     const node: Hierarchy.Node = {
       pointCount: Number(url.searchParams.get('c')),
@@ -147,7 +220,7 @@ async function serveTile(src: string, url: URL): Promise<Response> {
     };
     if (!node.pointCount) return new Response('empty node', { status: 404 });
 
-    const dec = await source.decodeNode(key, node);
+    const dec = await source.decodeNode(key, node, attributes);
     const n = dec.pointCount;
 
     // Reproject to ECEF and pick RTC_CENTER = centroid (float32-friendly frame).
@@ -165,7 +238,21 @@ async function serveTile(src: string, url: URL): Promise<Response> {
       cz += z;
     }
     const rtc: [number, number, number] = n ? [cx / n, cy / n, cz / n] : [0, 0, 0];
-    return new Response(encodePnts(ecef, dec.colors, rtc), {
+
+    // Per-point properties for styling. `Height` is carried explicitly rather
+    // than read off the position: the styling language's ${POSITION} is in the
+    // tile's own frame, and every tile has its own RTC_CENTER, so an elevation
+    // ramp built on it would restart at each tile.
+    const batch: Record<string, BatchArray> = {};
+    if (dec.intensity) batch.Intensity = dec.intensity;
+    if (dec.classification) batch.Classification = dec.classification;
+    if (attributes.includes('height')) {
+      const height = new Float32Array(n);
+      for (let i = 0; i < n; i++) height[i] = dec.positions[i * 3 + 2] * heightScale;
+      batch.Height = height;
+    }
+
+    return new Response(encodePnts(ecef, dec.colors, rtc, batch), {
       headers: { 'Content-Type': 'application/octet-stream' },
     });
   } catch (e) {

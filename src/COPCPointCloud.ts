@@ -1,4 +1,14 @@
 import { Cesium3DTileset, type BoundingSphere } from 'cesium';
+import type { COPCAttribute } from './core/CopcSource';
+import { buildColorStyle, COLOR_MODE_ATTRIBUTE, type COPCColorMode } from './styles';
+
+/** Metadata the Service Worker publishes on the generated tileset's asset. */
+interface COPCTilesetExtras {
+  pointCount: number;
+  hasColor: boolean;
+  heightRange: [number, number];
+  intensityRange: [number, number] | null;
+}
 
 /**
  * Where to find the Service Worker that transcodes COPC into 3D Tiles.
@@ -32,6 +42,19 @@ export interface COPCPointCloudShadingOptions {
 
 export interface COPCPointCloudOptions {
   serviceWorker?: COPCServiceWorkerOptions;
+  /**
+   * How to colour points. `rgb` uses the file's own colour; the others are
+   * driven by a per-point attribute, which is requested automatically.
+   * Defaults to `rgb` when the file has colour, `elevation` when it does not.
+   */
+  colorMode?: COPCColorMode;
+  /**
+   * Per-point attributes to encode into tiles, beyond what `colorMode` needs.
+   * Each costs bytes per point (height 4, intensity 2, classification 1, against
+   * 15 for position and colour), so request only what you use — but requesting
+   * a mode's attribute up front makes switching to it instant, with no refetch.
+   */
+  attributes?: COPCAttribute[];
   /** Pixels of allowed error before a tile refines. */
   maximumScreenSpaceError?: number;
   /** Tiles per generated tileset document before deeper nodes are delegated. */
@@ -114,6 +137,7 @@ async function ensureServiceWorker(options: COPCServiceWorkerOptions = {}): Prom
  */
 export class COPCPointCloud {
   private destroyed = false;
+  private mode: COPCColorMode;
 
   private constructor(
     /** Absolute URL of the COPC file being streamed. */
@@ -123,25 +147,51 @@ export class COPCPointCloud {
      * Cesium 3D Tiles feature — styling, picking, events — applies to it.
      */
     readonly tileset: Cesium3DTileset,
-  ) {}
+    /** Per-point attributes the tiles actually carry. */
+    readonly attributes: readonly COPCAttribute[],
+    private readonly extras: COPCTilesetExtras | undefined,
+    colorMode: COPCColorMode,
+  ) {
+    this.mode = colorMode;
+    this.applyStyle();
+  }
 
   static async fromUrl(url: string | URL, options: COPCPointCloudOptions = {}): Promise<COPCPointCloud> {
     const scope = await ensureServiceWorker(options.serviceWorker);
     // Resolve against the page so a relative path does not depend on where the
     // worker happens to be scoped.
     const src = new URL(url, typeof document !== 'undefined' ? document.baseURI : undefined).href;
+    const endpoint = (name: string) => {
+      const u = new URL(`copc-tiles/${name}`, scope);
+      u.searchParams.set('src', src);
+      return u;
+    };
 
-    const tilesetUrl = new URL('copc-tiles/tileset.json', scope);
-    tilesetUrl.searchParams.set('src', src);
+    // Choosing a default colour mode needs to know whether the file has colour,
+    // and that has to happen before the tileset URL is formed — the URL encodes
+    // which attributes tiles carry. One header-only request settles it.
+    let colorMode = options.colorMode;
+    if (!colorMode) {
+      const info = (await fetch(endpoint('info.json')).then((r) => r.json())) as COPCTilesetExtras;
+      colorMode = info.hasColor ? 'rgb' : 'elevation';
+    }
+
+    const needed = COLOR_MODE_ATTRIBUTE[colorMode];
+    const attributes = [...new Set([...(options.attributes ?? []), ...(needed ? [needed] : [])])];
+
+    const tilesetUrl = endpoint('tileset.json');
     tilesetUrl.searchParams.set(
       'mt',
       String(options.maxTilesPerChunk ?? COPC_DEFAULTS.maxTilesPerChunk),
     );
+    if (attributes.length) tilesetUrl.searchParams.set('a', attributes.join(','));
 
     const tileset = await Cesium3DTileset.fromUrl(tilesetUrl.href, {
       maximumScreenSpaceError:
         options.maximumScreenSpaceError ?? COPC_DEFAULTS.maximumScreenSpaceError,
     });
+    const extras = (tileset.asset as { extras?: { pointstream3d?: COPCTilesetExtras } } | undefined)
+      ?.extras?.pointstream3d;
 
     const shading = { ...COPC_DEFAULTS.pointCloudShading, ...options.pointCloudShading };
     Object.assign(tileset.pointCloudShading, shading);
@@ -151,12 +201,51 @@ export class COPCPointCloud {
     tileset.dynamicScreenSpaceError =
       options.dynamicScreenSpaceError ?? COPC_DEFAULTS.dynamicScreenSpaceError;
 
-    return new COPCPointCloud(src, tileset);
+    return new COPCPointCloud(src, tileset, attributes, extras, colorMode);
   }
 
   /** Bounding volume of the whole file, for `viewer.zoomTo`/`flyTo`. */
   get boundingSphere(): BoundingSphere {
     return this.tileset.boundingSphere;
+  }
+
+  /** Total points in the file, as reported by its header. */
+  get pointCount(): number | undefined {
+    return this.extras?.pointCount;
+  }
+
+  /** Whether the file carries per-point RGB. */
+  get hasColor(): boolean | undefined {
+    return this.extras?.hasColor;
+  }
+
+  /**
+   * Active colour mode. Assigning swaps the GPU style — no tiles are refetched.
+   *
+   * Switching to a mode whose attribute was not requested at load time throws,
+   * because the tiles simply do not carry it; pass it in `attributes` up front.
+   */
+  get colorMode(): COPCColorMode {
+    return this.mode;
+  }
+
+  set colorMode(mode: COPCColorMode) {
+    const needed = COLOR_MODE_ATTRIBUTE[mode];
+    if (needed && !this.attributes.includes(needed)) {
+      throw new Error(
+        `colorMode "${mode}" needs the "${needed}" attribute, which these tiles do not carry. ` +
+          `Pass attributes: ['${needed}'] to COPCPointCloud.fromUrl().`,
+      );
+    }
+    this.mode = mode;
+    this.applyStyle();
+  }
+
+  private applyStyle(): void {
+    this.tileset.style = buildColorStyle(this.mode, {
+      heightRange: this.extras?.heightRange,
+      intensityRange: this.extras?.intensityRange,
+    });
   }
 
   get isDestroyed(): boolean {

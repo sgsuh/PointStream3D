@@ -214,7 +214,7 @@ SW는 **자기 scope 안의 클라이언트가 낸 요청에만** fetch 이벤�
 
 - **EDL**: `tileset.pointCloudShading = { attenuation: true, eyeDomeLighting: true, eyeDomeLightingStrength, eyeDomeLightingRadius }`. **주의: `eyeDomeLighting`은 `attenuation: true`일 때만 실제 동작.** WebGL2(Cesium 기본)에서 바로 작동.
 - **포인트 크기 감쇠**: geometric-error 기반 자동. 우리는 노드 spacing → geometricError를 tileset에 정확히 매핑하면 됨. → **§8.1에서 완료(단위 버그 포함)**.
-- **컬러 모드**: `Cesium3DTileStyle`로 런타임 전환 — RGB / `${Intensity}` / `${Classification}` / `${POSITION}[2]`(고도 램프). GPU 표현식이라 셰이더 작성 불필요.
+- **컬러 모드**: `Cesium3DTileStyle`로 런타임 전환. GPU 표현식이라 셰이더 작성 불필요. → **§8.2에서 구현 완료**.
 - **포인트 버짓**: `maximumScreenSpaceError` + `cacheBytes`로 Potree식 버짓 근사.
 - **LOD refinement**: 우리는 `refine: "ADD"` 사용 — 포인트 클라우드는 자식 노드가 부모를 대체하지 않고 **디테일을 누적**하는 구조라 COPC 옥트리 의미와 일치하고, 팝핑도 REPLACE보다 덜하다(기존 점이 사라지지 않고 점만 추가됨).
 
@@ -294,6 +294,30 @@ GE를 정확히 고치니 `sse=8`에서 배경이 비치는 **구멍**이 생겼
 예산 경계에서 잘린 노드 중 **자식이 없는 리프는 전환하지 않는다** — 이미 갖고 있는 타일 하나를 받으려 왕복을 쓰기 때문. 이 처리로 sofi 외부 타일셋 요청이 28 → **22**로 줄었고 출력은 동일했다.
 
 > 주의: 개요 카메라에서는 refine이 루트 청크(513타일) 안에서 끝나 `page.json` 요청이 0이다. 이는 lazy 로딩이 의도대로 동작하는 것이지 회귀가 아니다 — sub-page 경로 검증은 반드시 근접 카메라로 해야 한다.
+
+---
+
+### 8.2 컬러 모드 (rgb / elevation / intensity / classification)
+
+`pnts`는 POSITION+RGB만 싣고 있었다. 스타일링에 필요한 per-point 값을 **Batch Table**로 추가한다 — `pnts`에서 feature table에 `BATCH_ID`가 없으면 batch table은 **포인트 단위로 인덱싱**되며, 이게 정확히 Cesium 스타일 언어의 `${Intensity}` 등이 읽는 형태다.
+
+**고도 램프에 `${POSITION}[2]`를 쓰면 안 된다.** 스타일 언어의 `${POSITION}`은 **타일 로컬 좌표**인데 우리는 타일마다 노드 centroid를 `RTC_CENTER`로 잡는다 → 램프가 타일 경계마다 리셋된다. 그래서 소스 Z에 수직 단위 계수를 적용한 **절대 높이(m)를 `Height` 속성으로 명시 인코딩**한다. 실제 렌더에서 타일 경계를 넘어 연속적인 그라디언트가 나오는 것으로 확인됨.
+
+**범위는 클라이언트가 알 수 없다.** 램프에는 min/max가 필요한데 이 정보는 SW에만 있다. 생성한 `tileset.json`의 `asset.extras`에 실어 보낸다(Cesium이 `tileset.asset`에 그대로 보존). 높이 범위는 COPC 헤더 + 수직 단위 계수로 즉시 나오지만, **LAS에는 intensity 범위 필드가 없어** 루트 노드에서 실측한다(어차피 모든 뷰어가 로드하는 노드). 고정 `[0, 65535]`를 쓰면 대부분의 데이터가 거의 검게 나온다.
+
+**기본 모드 선택의 순환 문제**: 기본값은 파일의 RGB 유무에 달렸는데, attribute 집합은 타일셋 URL에 인코딩되므로 URL을 만들기 *전에* 정해져야 한다. 헤더만 읽는 `info.json` 엔드포인트를 추가해 해결했다. `colorMode`를 명시하면 이 요청은 생략된다.
+
+#### 비용과 전환
+
+| | |
+|---|---|
+| 바이트/포인트 | position+color 15, `height` +4, `intensity` +2, `classification` +1 |
+| autzen 동일 카메라 GPU 지오메트리 | 17.7 MB → **25.9 MB** (전 속성, +47%) |
+| 모드 전환 시 재요청 타일 | **0** (`scripts/smoke-colormode.mjs`로 검증) |
+
+전환이 공짜인 이유는 스타일이 GPU 표현식이기 때문이다. 대신 **해당 속성이 타일에 실려 있어야** 하므로, 나중에 쓸 모드는 `attributes`로 미리 요청해야 한다. 없는 속성의 모드로 바꾸면 조용히 잘못 그리는 대신 throw 한다.
+
+검증: autzen 4개 모드 전부 렌더 확인. sofi(RGB 없음)는 `hasColor: false` → **`elevation` 자동 선택**되고 sub-page lazy 경로(distinct page 21개)도 그대로 동작.
 
 ---
 

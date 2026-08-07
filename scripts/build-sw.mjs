@@ -1,13 +1,15 @@
 // Bundle the two runtime workers (copc.js + laz-perf + proj4 + our encoders)
-// into single ESM files, and copy the laz-perf wasm next to them — the Service
+// into single ESM files, copy the laz-perf wasm next to them — the Service
 // Worker resolves the wasm relative to its own URL and passes that on to the
-// decode workers, so all three must stay siblings.
+// decode workers, so all three must stay siblings — and emit the third-party
+// notices for whatever ended up inside those bundles.
 //
 //   node scripts/build-sw.mjs [outdir...]     (default: public)
 //
 // Run in the container:  docker compose run --rm web npm run build:sw
 import { build } from 'esbuild';
-import { copyFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { writeNotices } from './notices.mjs';
 
 const outDirs = process.argv.slice(2);
 if (outDirs.length === 0) outDirs.push('public');
@@ -32,10 +34,13 @@ const BUNDLES = [
   ['src/worker/decodeWorker.ts', 'pointstream3d-worker.js'],
 ];
 
+const self = JSON.parse(readFileSync('package.json', 'utf8'));
+
 for (const outDir of outDirs) {
   mkdirSync(outDir, { recursive: true });
+  const metafiles = [];
   for (const [entry, outfile] of BUNDLES) {
-    await build({
+    const result = await build({
       entryPoints: [entry],
       bundle: true,
       format: 'esm',
@@ -43,11 +48,14 @@ for (const outDir of outDirs) {
       target: 'es2020',
       outfile: `${outDir}/${outfile}`,
       plugins: [stubNodeBuiltins],
+      metafile: true,
       logLevel: 'info',
     });
+    metafiles.push(result.metafile);
   }
   copyFileSync('node_modules/laz-perf/lib/web/laz-perf.wasm', `${outDir}/laz-perf.wasm`);
+  const notices = writeNotices(outDir, metafiles, self);
   console.log(
-    `bundled -> ${outDir}/{${BUNDLES.map(([, f]) => f).join(',')}} ; wasm -> ${outDir}/laz-perf.wasm`,
+    `bundled -> ${outDir}/{${BUNDLES.map(([, f]) => f).join(',')}} ; wasm -> ${outDir}/laz-perf.wasm ; notices -> ${notices}`,
   );
 }

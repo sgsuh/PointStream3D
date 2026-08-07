@@ -55,6 +55,10 @@ Copy them into your static directory (e.g. `public/`) as a build step:
 > `pointstream3d-worker.js` is optional: with `decodePool: { count: 0 }` the Service Worker
 > decodes on its own thread and the file is never fetched.
 
+Those bundles carry third-party code; `dist/THIRD-PARTY-NOTICES.txt` lists it with the full
+licence texts, generated at build time from what the bundler actually included. See
+[`docs/sbom.md`](docs/sbom.md).
+
 > **Scope matters.** A Service Worker only receives fetch events from pages inside its
 > scope, so serve `pointstream3d-sw.js` from your app's base path — the site root for a
 > root-served app, or `/my-app/` for a project site. To serve it from a narrower path
@@ -242,8 +246,9 @@ src/core/
   georef.ts / ecef.ts     Cesium-free reprojection (runs inside the workers)
   pnts.ts                 pnts encoder (RTC_CENTER, float32)
   wkt.ts                  WKT helpers: compound-CRS extraction, feet -> metre
-scripts/                  build-sw, smoke*, probe-copc, screenshot (headless harness)
+scripts/                  build-sw, notices, smoke*, probe-copc, screenshot (headless harness)
 docs/architecture.md      architecture decision + verification and tuning log
+docs/sbom.md              dependency inventory, licences, and what ships in the bundles
 ```
 
 ## Sample data

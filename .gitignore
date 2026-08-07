@@ -13,6 +13,7 @@ public/pointstream3d-sw.js
 public/pointstream3d-sw.js.map
 public/pointstream3d-worker.js
 public/pointstream3d-worker.js.map
+public/THIRD-PARTY-NOTICES.txt
 public/laz-perf.wasm
 # Built demo site
 dist-demo

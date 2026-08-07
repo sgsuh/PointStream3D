@@ -18,8 +18,9 @@ const COLOR_MODES: COPCColorMode[] = ['rgb', 'elevation', 'intensity', 'classifi
 // a time:  tiles.html?src=/remote-s3/hobu-lidar/sofi.copc.laz&sse=8
 const params = new URLSearchParams(location.search);
 // Relative, so the demo also works when served under a base path; the library
-// resolves it against the document base.
-const SRC = params.get('src') ?? 'data/autzen.copc.laz';
+// resolves it against the document base. The published demo has no sample files
+// next to it and points at a CORS-enabled bucket instead (VITE_DEMO_SRC).
+const SRC = params.get('src') ?? import.meta.env.VITE_DEMO_SRC ?? 'data/autzen.copc.laz';
 const ZOOM = Number(params.get('zoom') ?? '0.9'); // camera range as a fraction of the bounding radius
 const MAX_SSE = Number(params.get('sse') ?? String(COPC_DEFAULTS.maximumScreenSpaceError));
 // Explicit camera as "lon,lat,height,heading,pitch" (degrees/metres). Framing via

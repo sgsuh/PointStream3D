@@ -179,7 +179,16 @@ SW는 **자기 scope 안의 클라이언트가 낸 요청에만** fetch 이벤�
 
 이에 맞춰 타일 URL과 wasm 경로를 **전부 scope 상대로** 만들었다(`self.registration.scope`, `self.location`). 루트 절대경로였다면 GitHub Pages 프로젝트 사이트에서 바로 깨진다. `--base=/PointStream3D/`로 빌드해 서브패스에서 헤드리스 검증 완료 — 타일 URL이 `/PointStream3D/copc-tiles/...`로 나가고 LOD 수치는 루트 서빙과 동일.
 
-> 데모 빌드 주의: `vite-plugin-cesium`이 base를 출력 경로에 중복 적용해 Cesium 에셋을 `dist-demo/<base>/cesium/`에 복사한다(플러그인 버그). GitHub Pages 배포 시 해당 디렉터리를 끌어올리는 후처리가 필요하다.
+> 데모 빌드 주의: `vite-plugin-cesium`이 base를 출력 경로에 중복 적용해 Cesium 에셋을 `dist-demo/<base>/cesium/`에 복사한다(플러그인 버그). **HTML이 내보내는 URL은 맞고 디스크 위치만 한 단계 깊다.** `vite.config.ts`의 `copyRuntimeAssets` 플러그인이 빌드 후 끌어올린다. 이때 `closeBundle`은 **병렬 훅**이라 그냥 등록하면 플러그인의 비동기 복사보다 먼저 끝나버린다 → `{ sequential: true, order: 'post' }`로 지정해야 한다.
+
+### GitHub Pages 배포
+
+`.github/workflows/pages.yml`이 main 푸시마다 `npm run build:pages` → Pages 아티팩트 업로드. 저장소 설정에서 **Pages → Source = GitHub Actions**를 켜야 동작한다.
+
+- **base**는 저장소 이름에서 파생한다(`PAGES_BASE=/${{ github.event.repository.name }}/`) — 하드코딩하지 않는다.
+- **샘플 데이터는 배포물에 넣지 않는다.** Vite는 `public/`을 통째로 복사하므로 autzen 81MB가 딸려 나간다. 빌드 시에만 `publicDir: false`로 끄고 런타임 에셋 4개(SW·워커·wasm·NOTICES)만 명시 복사한다 → 사이트 15MB.
+- 대신 데모 기본 소스를 **CORS 허용 공개 버킷**으로 돌린다(`VITE_DEMO_SRC`). `s3.amazonaws.com/hobu-lidar/*`와 `raw.githubusercontent.com`의 COPC 샘플 모두 `ACAO: *` + Range 206을 확인했으므로 dev 프록시 없이 직접 스트리밍된다.
+- 검증: `vite preview --base=/PointStream3D/`로 서브패스 서빙 후 헤드리스 렌더 — 원격 S3 데이터로 33타일 전부 풀 디코드(`fallbacks: 0`), 렌더 정상. CI 경로(`npm ci` → `build:pages`)도 깨끗한 컨테이너에서 재현 확인.
 
 ---
 

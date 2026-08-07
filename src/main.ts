@@ -12,7 +12,12 @@ import { makeToEcef } from './core/reproject';
 
 // PoC config -----------------------------------------------------------------
 // Sample to load. autzen = real geolocated (Oregon); ellipsoid = tiny synthetic.
-const DATA_URL = '/data/autzen.copc.laz';
+// Relative so it survives a base path; the published demo overrides it with a
+// CORS-enabled bucket URL, having no sample files of its own (VITE_DEMO_SRC).
+const DATA_URL = new URL(
+  import.meta.env.VITE_DEMO_SRC ?? 'data/autzen.copc.laz',
+  document.baseURI,
+).href;
 // Octree depth to load for this PoC (0 = coarsest root node).
 const MAX_DEPTH = 3;
 // Cap total points — PointPrimitiveCollection is a PoC stand-in, not the final

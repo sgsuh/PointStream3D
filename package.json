@@ -42,6 +42,7 @@
     "build:sw": "node scripts/build-sw.mjs public",
     "build:sw:dist": "node scripts/build-sw.mjs public dist",
     "build:demo": "npm run build:sw && vite build",
+    "build:pages": "npm run build:sw && vite build --base=\"${PAGES_BASE:-/PointStream3D/}\"",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
     "smoke": "node scripts/smoke.mjs"
   },

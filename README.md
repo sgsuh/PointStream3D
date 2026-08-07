@@ -4,6 +4,9 @@ Stream and render **COPC** (Cloud Optimized Point Cloud) files **directly in Ces
 no server-side tiling, no pre-conversion. Point it at a `.copc.laz` URL and it renders on
 the globe, with eye-dome lighting and point attenuation applied by the engine.
 
+**[Live demo →](https://sgsuh.github.io/PointStream3D/tiles.html)** — streams an 81 MB COPC
+file straight from a public bucket, no server of its own.
+
 > KOSSA 2026 오픈소스 개발자대회 · Gaia3D 지정과제. 설계 근거와 측정 로그는
 > [`docs/architecture.md`](docs/architecture.md) 참고.
 
@@ -173,6 +176,9 @@ docker compose run --rm web npm run build
 docker compose run --rm web npm run build:demo
 docker compose run --rm web npm run typecheck
 
+# Build the demo exactly as GitHub Pages does: base path, remote sample, no data/
+docker compose run --rm web npm run build:pages
+
 # Headless data-pipeline check (no browser): decode + reproject
 docker compose run --rm web npm run smoke public/data/autzen.copc.laz
 
@@ -182,6 +188,13 @@ docker compose run --rm web node scripts/probe-copc.mjs public/data/autzen.copc.
 
 Demo pages: `tiles.html` is the library demo; `index.html` is the original
 `PointPrimitiveCollection` PoC that proved the data pipeline.
+
+`.github/workflows/pages.yml` publishes `tiles.html` to GitHub Pages on every push to
+`main`. It is a project site, so the build takes the repository name as its base path; the
+Service Worker addresses everything relative to its own scope, so nothing else needs to
+know. The published site carries no COPC samples — it streams one from a CORS-enabled
+public bucket (`VITE_DEMO_SRC`) — which keeps it at 15 MB. Enabling it once in the
+repository requires **Settings → Pages → Source = GitHub Actions**.
 
 ### Streaming a large remote file
 

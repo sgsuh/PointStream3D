@@ -1,6 +1,7 @@
-// Bundle the Service Worker (copc.js + laz-perf + proj4 + our encoders) into a
-// single ESM file, and copy the laz-perf wasm next to it — the worker resolves
-// the wasm relative to its own URL, so the two must stay siblings.
+// Bundle the two runtime workers (copc.js + laz-perf + proj4 + our encoders)
+// into single ESM files, and copy the laz-perf wasm next to them — the Service
+// Worker resolves the wasm relative to its own URL and passes that on to the
+// decode workers, so all three must stay siblings.
 //
 //   node scripts/build-sw.mjs [outdir...]     (default: public)
 //
@@ -26,18 +27,27 @@ const stubNodeBuiltins = {
   },
 };
 
+const BUNDLES = [
+  ['src/sw/sw.ts', 'pointstream3d-sw.js'],
+  ['src/worker/decodeWorker.ts', 'pointstream3d-worker.js'],
+];
+
 for (const outDir of outDirs) {
   mkdirSync(outDir, { recursive: true });
-  await build({
-    entryPoints: ['src/sw/sw.ts'],
-    bundle: true,
-    format: 'esm',
-    platform: 'browser',
-    target: 'es2020',
-    outfile: `${outDir}/pointstream3d-sw.js`,
-    plugins: [stubNodeBuiltins],
-    logLevel: 'info',
-  });
+  for (const [entry, outfile] of BUNDLES) {
+    await build({
+      entryPoints: [entry],
+      bundle: true,
+      format: 'esm',
+      platform: 'browser',
+      target: 'es2020',
+      outfile: `${outDir}/${outfile}`,
+      plugins: [stubNodeBuiltins],
+      logLevel: 'info',
+    });
+  }
   copyFileSync('node_modules/laz-perf/lib/web/laz-perf.wasm', `${outDir}/laz-perf.wasm`);
-  console.log(`SW bundled -> ${outDir}/pointstream3d-sw.js ; wasm -> ${outDir}/laz-perf.wasm`);
+  console.log(
+    `bundled -> ${outDir}/{${BUNDLES.map(([, f]) => f).join(',')}} ; wasm -> ${outDir}/laz-perf.wasm`,
+  );
 }

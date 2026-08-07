@@ -1,5 +1,7 @@
 import { Cesium3DTileset, type BoundingSphere } from 'cesium';
 import type { COPCAttribute } from './core/CopcSource';
+import { RELEASE } from './core/protocol';
+import { DecodePool, defaultWorkerCount } from './decodePool';
 import { buildColorStyle, COLOR_MODE_ATTRIBUTE, type COPCColorMode } from './styles';
 
 /** Metadata the Service Worker publishes on the generated tileset's asset. */
@@ -30,6 +32,24 @@ export interface COPCServiceWorkerOptions {
   register?: boolean;
 }
 
+/**
+ * The pool of workers that LAZ-decode tiles.
+ *
+ * Without it the Service Worker decodes on its own single thread, which is the
+ * throughput ceiling on large files. The workers are created by the page —
+ * a Service Worker may not create them — and handed to it over MessagePorts.
+ * `pointstream3d-worker.js` must be served alongside `pointstream3d-sw.js`.
+ */
+export interface COPCDecodePoolOptions {
+  /**
+   * Number of workers. Defaults to one per core less one, capped at 6. Set 0 to
+   * decode inside the Service Worker instead (no extra asset to serve).
+   */
+  count?: number;
+  /** Script URL. Defaults to `pointstream3d-worker.js` next to the Service Worker. */
+  url?: string | URL;
+}
+
 /** Point-cloud shading, forwarded to `Cesium3DTileset.pointCloudShading`. */
 export interface COPCPointCloudShadingOptions {
   attenuation?: boolean;
@@ -42,6 +62,7 @@ export interface COPCPointCloudShadingOptions {
 
 export interface COPCPointCloudOptions {
   serviceWorker?: COPCServiceWorkerOptions;
+  decodePool?: COPCDecodePoolOptions;
   /**
    * How to colour points. `rgb` uses the file's own colour; the others are
    * driven by a per-point attribute, which is requested automatically.
@@ -93,8 +114,11 @@ export const COPC_DEFAULTS = {
 } as const;
 
 const DEFAULT_SW_FILE = 'pointstream3d-sw.js';
+const DEFAULT_WORKER_FILE = 'pointstream3d-worker.js';
 
-async function ensureServiceWorker(options: COPCServiceWorkerOptions = {}): Promise<string> {
+async function ensureServiceWorker(
+  options: COPCServiceWorkerOptions = {},
+): Promise<{ scope: string; scriptURL: string }> {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
     throw new Error(
       'PointStream3D requires Service Workers, which need a secure context ' +
@@ -118,7 +142,9 @@ async function ensureServiceWorker(options: COPCServiceWorkerOptions = {}): Prom
       navigator.serviceWorker.addEventListener('controllerchange', () => resolve(), { once: true });
     });
   }
-  return registration.scope;
+  const scriptURL =
+    registration.active?.scriptURL ?? navigator.serviceWorker.controller?.scriptURL ?? '';
+  return { scope: registration.scope, scriptURL };
 }
 
 /**
@@ -151,13 +177,27 @@ export class COPCPointCloud {
     readonly attributes: readonly COPCAttribute[],
     private readonly extras: COPCTilesetExtras | undefined,
     colorMode: COPCColorMode,
+    private readonly pool: DecodePool | undefined,
   ) {
     this.mode = colorMode;
     this.applyStyle();
   }
 
   static async fromUrl(url: string | URL, options: COPCPointCloudOptions = {}): Promise<COPCPointCloud> {
-    const scope = await ensureServiceWorker(options.serviceWorker);
+    const { scope, scriptURL } = await ensureServiceWorker(options.serviceWorker);
+
+    // Start the decode pool before the first tile is asked for: the Service
+    // Worker only routes to workers it already holds a port for, and decodes
+    // inline until then.
+    const workerCount = options.decodePool?.count ?? defaultWorkerCount();
+    const pool =
+      workerCount > 0
+        ? DecodePool.acquire(
+            new URL(options.decodePool?.url ?? DEFAULT_WORKER_FILE, scriptURL || scope).href,
+            workerCount,
+          )
+        : undefined;
+
     // Resolve against the page so a relative path does not depend on where the
     // worker happens to be scoped.
     const src = new URL(url, typeof document !== 'undefined' ? document.baseURI : undefined).href;
@@ -201,7 +241,12 @@ export class COPCPointCloud {
     tileset.dynamicScreenSpaceError =
       options.dynamicScreenSpaceError ?? COPC_DEFAULTS.dynamicScreenSpaceError;
 
-    return new COPCPointCloud(src, tileset, attributes, extras, colorMode);
+    return new COPCPointCloud(src, tileset, attributes, extras, colorMode, pool);
+  }
+
+  /** Decode workers backing this cloud. 0 means the Service Worker decodes. */
+  get workerCount(): number {
+    return this.pool?.size ?? 0;
   }
 
   /** Bounding volume of the whole file, for `viewer.zoomTo`/`flyTo`. */
@@ -253,17 +298,19 @@ export class COPCPointCloud {
   }
 
   /**
-   * Destroy the tileset and drop the worker's cached header and hierarchy pages
-   * for this file. Nothing else evicts those — they are keyed by source URL and
-   * outlive the tileset.
+   * Destroy the tileset and drop the cached header and hierarchy pages for this
+   * file. Nothing else evicts those — they are keyed by source URL and outlive
+   * the tileset. Decode workers are shared, so they are terminated only once the
+   * last point cloud using them is destroyed.
    */
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    navigator.serviceWorker?.controller?.postMessage({
-      type: 'pointstream3d:release',
-      src: this.url,
-    });
+    navigator.serviceWorker?.controller?.postMessage({ type: RELEASE, src: this.url });
+    if (this.pool) {
+      this.pool.release(this.url);
+      DecodePool.release(this.pool);
+    }
     if (!this.tileset.isDestroyed()) this.tileset.destroy();
   }
 }

@@ -16,6 +16,12 @@ memory**, and its point-cloud shading applies to our tiles for free. Large files
 each COPC hierarchy page becomes an external tileset the worker resolves on demand, so only
 the visible part of the octree is ever fetched.
 
+LAZ decoding happens in a pool of dedicated workers, so it never occupies the Service
+Worker's single thread. Those workers are created by the page — the HTML spec does not
+expose `Worker` to a Service Worker — and are handed to it over `MessagePort`s, so tiles
+flow Service Worker → decode worker → back without ever touching the thread Cesium renders
+on. See [`docs/architecture.md` §8.3](docs/architecture.md) for the measurements.
+
 ## Install
 
 ```bash
@@ -24,13 +30,15 @@ npm install pointstream3d cesium
 
 `cesium` is a peer dependency — it is never bundled.
 
-### Serve the two runtime assets
+### Serve the three runtime assets
 
-The package ships a prebuilt Service Worker and the laz-perf WASM. Both must be served by
-your app, **side by side** (the worker resolves the wasm relative to its own URL):
+The package ships a prebuilt Service Worker, a decode worker, and the laz-perf WASM. All
+three must be served by your app, **side by side** (each resolves the next relative to its
+own URL):
 
 ```
 node_modules/pointstream3d/dist/pointstream3d-sw.js
+node_modules/pointstream3d/dist/pointstream3d-worker.js
 node_modules/pointstream3d/dist/laz-perf.wasm
 ```
 
@@ -39,10 +47,13 @@ Copy them into your static directory (e.g. `public/`) as a build step:
 ```json
 {
   "scripts": {
-    "postinstall": "cp node_modules/pointstream3d/dist/{pointstream3d-sw.js,laz-perf.wasm} public/"
+    "postinstall": "cp node_modules/pointstream3d/dist/{pointstream3d-sw.js,pointstream3d-worker.js,laz-perf.wasm} public/"
   }
 }
 ```
+
+> `pointstream3d-worker.js` is optional: with `decodePool: { count: 0 }` the Service Worker
+> decodes on its own thread and the file is never fetched.
 
 > **Scope matters.** A Service Worker only receives fetch events from pages inside its
 > scope, so serve `pointstream3d-sw.js` from your app's base path — the site root for a
@@ -120,6 +131,8 @@ const cloud = await COPCPointCloud.fromUrl(url, {
 | option | default | notes |
 |---|---:|---|
 | `serviceWorker.url` | `pointstream3d-sw.js` next to the document base | set `register: false` if your app registers it |
+| `decodePool.count` | cores − 1, capped at 6 | LAZ decode workers; `0` decodes in the Service Worker |
+| `decodePool.url` | `pointstream3d-worker.js` next to the Service Worker | |
 | `colorMode` | `rgb`, or `elevation` with no RGB | see above |
 | `attributes` | what `colorMode` needs | extra per-point attributes to carry for later switching |
 | `maximumScreenSpaceError` | `4` | pixels of allowed error before a tile refines |
@@ -147,8 +160,8 @@ Everything runs in Docker — no local Node/npm needed.
 # Download public COPC samples into public/data/ (git-ignored)
 docker compose run --rm web sh scripts/fetch-data.sh
 
-# Build the Service Worker bundle, then start the dev server -> http://localhost:5173
-docker compose run --rm web npm run build:sw
+# Build the Service Worker + decode worker bundles, then start the dev server
+docker compose run --rm web npm run build:sw   # -> http://localhost:5173
 docker compose up -d
 
 # Build the library (dist/), the demo site (dist-demo/), or type-check
@@ -190,19 +203,24 @@ docker run --rm --network pointstream3d_default \
   ghcr.io/puppeteer/puppeteer:latest screenshot.mjs
 ```
 
-Check that colour-mode switching refetches nothing:
+Check that colour-mode switching refetches nothing, and that the decode pool is used and
+survives a Service Worker restart (swap the script name):
 
 ```bash
 docker run --rm --network pointstream3d_default \
   -e TARGET_URL="http://web:5173/tiles.html" \
   -v "$PWD/scripts:/home/pptruser/work:ro" \
   -w /home/pptruser/work --entrypoint node \
-  ghcr.io/puppeteer/puppeteer:latest smoke-colormode.mjs
+  ghcr.io/puppeteer/puppeteer:latest smoke-colormode.mjs   # or smoke-pool.mjs
 ```
 
+`<scope>copc-tiles/stats.json` reports where tiles were decoded (pool vs the Service
+Worker's own thread, and how many fell back), which `screenshot.mjs` includes in its dump.
+
 The demo exposes every LOD knob as a query parameter (`?sse=`, `?ges=`, `?mt=`, `?cache=`,
-`?dyn=`), plus `?color=` and `?attrs=0` (drop per-point attributes, to measure their cost)
-and `?cam=lon,lat,height,heading,pitch`. **Pin `?cam=` for any A/B run** —
+`?dyn=`), plus `?color=` and `?attrs=0` (drop per-point attributes, to measure their cost),
+`?workers=` (decode pool size; `0` decodes in the Service Worker), `?maxreq=` (Cesium's
+per-server request cap, default 6) and `?cam=lon,lat,height,heading,pitch`. **Pin `?cam=` for any A/B run** —
 `zoomTo()` frames from the root bounding volume, so changing a bounding volume silently
 reframes the shot and invalidates the comparison. `screenshot.mjs` prints a reusable `cam`
 string.
@@ -213,14 +231,18 @@ string.
 src/index.ts              public entry point
 src/COPCPointCloud.ts     public API: COPCPointCloud.fromUrl(), options, defaults
 src/sw/sw.ts              Service Worker: serves tileset.json / page.json / *.pnts
+src/decodePool.ts         page-owned decode workers, shared by URL and ref-counted
+src/worker/decodeWorker.ts  one decode worker: range fetch -> LAZ -> reproject -> pnts
 src/core/
   CopcSource.ts           copc.js wrapper: HTTP-range getter, hierarchy, node decode
+  tile.ts                 one node -> one pnts tile (shared by worker and SW fallback)
+  protocol.ts             page/SW/worker messages, and why ports are handed over
   tileset.ts              COPC hierarchy page -> 3D Tiles chunk + external tilesets
   bounds.ts               node cube -> tight oriented box, clamped to real extent
-  georef.ts / ecef.ts     Cesium-free reprojection (runs inside the worker)
+  georef.ts / ecef.ts     Cesium-free reprojection (runs inside the workers)
   pnts.ts                 pnts encoder (RTC_CENTER, float32)
   wkt.ts                  WKT helpers: compound-CRS extraction, feet -> metre
-scripts/                  build-sw, smoke, probe-copc, screenshot (headless harness)
+scripts/                  build-sw, smoke*, probe-copc, screenshot (headless harness)
 docs/architecture.md      architecture decision + verification and tuning log
 ```
 

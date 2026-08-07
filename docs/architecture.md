@@ -124,9 +124,13 @@ Cesium3DTileset
 src/
 ├─ index.ts                 공개 진입점 (re-export만)
 ├─ COPCPointCloud.ts        공개 API: fromUrl(), 옵션 타입, COPC_DEFAULTS
-├─ sw/sw.ts                 Service Worker: tileset.json / page.json / *.pnts 응답
+├─ sw/sw.ts                 Service Worker: tileset.json / page.json / *.pnts 응답 + 풀 라우팅
+├─ decodePool.ts            페이지 소유 디코드 워커 풀 (URL별 공유, ref-count)
+├─ worker/decodeWorker.ts   디코드 워커: range fetch → LAZ 디코드 → 재투영 → pnts
 ├─ core/
 │  ├─ CopcSource.ts         copc.js 래핑: HTTP-range Getter, 계층 로드, 노드 디코드
+│  ├─ tile.ts               노드 1개 → pnts 1개 (워커/SW 인라인 폴백이 공유)
+│  ├─ protocol.ts           페이지↔SW↔워커 메시지 타입 + 포트 핸드오버 근거
 │  ├─ tileset.ts            hierarchy page → 3D Tiles 청크 + external tileset (BFS 예산)
 │  ├─ bounds.ts             노드 큐브 → 실 extent 클램프 + oriented box
 │  ├─ pnts.ts               pnts 인코더 (RTC_CENTER, float32)
@@ -141,17 +145,18 @@ src/
 
 | 산출물 | 명령 | 내용 |
 |---|---|---|
-| `dist/` (배포 패키지) | `npm run build` | `pointstream3d.js`(3 kB, cesium external) + `pointstream3d-sw.js`(460 kB 번들) + `laz-perf.wasm` + `types/` |
+| `dist/` (배포 패키지) | `npm run build` | `pointstream3d.js`(9 kB, cesium external) + `pointstream3d-sw.js`(458 kB) + `pointstream3d-worker.js`(445 kB) + `laz-perf.wasm` + `types/` |
 | `dist-demo/` | `npm run build:demo` | 데모 사이트(`index.html`, `tiles.html`) |
 | `public/` | `npm run build:sw` | dev 서버용 SW + wasm |
 
-**클라이언트 번들이 3 kB인 이유**: copc.js·laz-perf·proj4는 전부 Service Worker 안에만 있다. 페이지 쪽 코드는 Cesium하고만 대화한다.
+**클라이언트 번들이 작은 이유**: copc.js·laz-perf·proj4는 전부 Service Worker와 디코드 워커 안에만 있다. 페이지 쪽 코드는 Cesium하고만 대화하고, 워커는 URL로만 참조한다.
 
 ### 공개 API
 
 ```ts
 const cloud = await COPCPointCloud.fromUrl('/data/autzen.copc.laz', {
   serviceWorker: { url, scope, register },
+  decodePool: { count, url },     // 디코드 워커 수 (기본 코어-1, 최대 6) / 스크립트 URL
   maximumScreenSpaceError: 4,
   maxTilesPerChunk: 512,
   pointCloudShading: { attenuation, eyeDomeLighting, geometricErrorScale, maximumAttenuation, ... },
@@ -319,6 +324,54 @@ GE를 정확히 고치니 `sse=8`에서 배경이 비치는 **구멍**이 생겼
 
 검증: autzen 4개 모드 전부 렌더 확인. sofi(RGB 없음)는 `hasColor: false` → **`elevation` 자동 선택**되고 sub-page lazy 경로(distinct page 21개)도 그대로 동작.
 
+### 8.3 디코드 워커 풀 (Week 2) — 측정 로그
+
+SW가 **단일 스레드**로 laz-perf 디코드를 돌리는 것이 리스크 표의 유일한 미해결 항목이었다. 워커 풀로 옮겼고, **동시에 그게 실제 병목이 아니었다는 것도 측정으로 확인**했다. 두 결과 모두 아래에 남긴다.
+
+#### 제약 — Service Worker는 워커를 만들 수 없다
+
+HTML 스펙의 IDL이 `[Exposed=(Window,DedicatedWorker,SharedWorker)]`이라 **`ServiceWorkerGlobalScope`에는 `Worker`가 노출되지 않는다**. Chrome 150 헤드리스 실측에서도 `typeof Worker === 'undefined'`, `new Worker()` → `ReferenceError`(classic·module 양쪽). 브라우저 버그가 아니라 설계이므로 우회 불가.
+
+**그래서 페이지가 워커를 만들고 `MessagePort`를 SW로 transfer 한다.** 이후 SW ↔ 워커가 직결되어 페이지 메인 스레드를 거치지 않는다. 대안(SW → 페이지 `message` 핸들러 → 워커)과 4 MB 버퍼 왕복으로 비교:
+
+| 경로 | 유휴 | **메인 스레드 1 s 블록 중** |
+|---|---:|---:|
+| SW → 페이지 → 워커 | 11.2 ms | **1001.7 ms** |
+| SW → 워커 직결 (채택) | 2.9 ms | **0.2 ms** |
+
+Cesium은 렌더 루프가 메인 스레드를 점유하므로 이 차이가 결정적이다. 버퍼는 transferable이라 복사도 없다.
+
+#### 생명주기 — 유일한 실패 모드
+
+포트는 직렬화가 불가능한데 **브라우저는 유휴 SW를 언제든 정지**시킨다. 되살아난 SW는 포트가 없다. 그래서: 포트가 없는 상태로 타일 요청이 오면 ① 그 타일은 인라인 디코드로 즉시 응답하고 ② 클라이언트들에 `need-ports`를 브로드캐스트해 재핸드셰이크한다. `scripts/smoke-pool.mjs`가 CDP로 SW를 실제로 정지시켜 이 경로를 검증한다 — 재시작 직후 첫 타일 인라인 143 ms → 재핸드셰이크 → 다음 타일 풀 59.6 ms, fallback 0건.
+
+#### 결과 — 디코드는 3.4배 빨라졌지만, 병목이 아니었다
+
+autzen 근접 고정 카메라, `sse=1`(214 타일, 8.88M pts). `swDecode`는 SW가 잰 타일당 디코드 응답 지연의 합.
+
+| | workers=0 | workers=6 |
+|---|---:|---:|
+| 타일당 디코드 지연 | 696 ms | **204 ms** (3.4× ↓) |
+| 전체 `loadMs` | 24.7 s | **21.4 s** (13% ↓) |
+| `pointsSelected` | 8,884,987 | 8,884,987 (동일) |
+
+`sse=4`(33 타일)에서는 4.18 s → 3.08 s (26% ↓).
+
+디코드 지연이 3.4배 줄었는데 전체는 13%만 줄었다 → **남는 시간은 Cesium이 메인 스레드에서 `pnts`를 Model로 트랜스코드하고 GPU에 올리는 비용**이다(214 타일 × ~100 ms). 헤드리스는 swiftshader(소프트웨어 GL)라 이 몫이 실제 GPU보다 과대평가된다. 즉 실환경 개선폭은 13%보다 크되, **디코드가 지배적이라는 원래 가정은 틀렸다.**
+
+#### sofi(2 GB 원격)는 100% 대역폭 병목
+
+| | loadMs | 타일당 디코드 지연 |
+|---|---:|---:|
+| workers=0 | 146.9 s | 7,288 ms |
+| workers=6 | 145.0 s | 7,373 ms |
+
+풀 유무와 무관하게 타일당 7.3초 — 전부 I/O 대기다. Cesium 요청 동시성을 올려도(`RequestScheduler.maximumRequestsPerServer` 6 → 24 → 48) 147 s / 136 s로 변화가 없고 **지연 합만 커진다**(대역폭 포화의 전형). 실제 파이프를 재보면 50 MB range 기준 **vite 프록시 경유 3.98 MB/s, S3 직결 6.31 MB/s** — sofi 근접 뷰가 받는 바이트를 이 속도로 나누면 측정된 ~140 s가 그대로 나온다.
+
+> **핸드오프에 적혀 있던 "sofi 근접 로드 ~80 s = laz-perf 디코드 성능"은 오귀인이었다.** 그 수치는 네트워크였다. 워커 풀은 여전히 옳은 구조지만(SW 단일 스레드 직렬화 제거, 대역폭이 넉넉한 로컬·사내 데이터에서 이득이 그대로 남음), **대용량 원격 파일의 로드 시간을 줄이는 수단은 아니다.**
+
+`?workers=`(개수)와 `?maxreq=`(Cesium 요청 상한)로 데모에서 A/B 할 수 있다.
+
 ---
 
 ## 9. 리스크 & 완화
@@ -328,7 +381,7 @@ GE를 정확히 고치니 `sse=8`에서 배경이 비치는 **구멍**이 생겼
 | **SW 콘텐츠 브리지가 예상보다 복잡** | 高 | **Week 0 PoC에서 이 경로를 최우선 검증**. 안 되면 방식 1(blob)로 데모 확보 후 SW 병행 |
 | Implicit tiling subtree 생성 난이도 | 中 | 초기엔 explicit nested tileset로 시작, implicit는 최적화 단계로 |
 | CRS→ECEF 재투영·정밀도 버그 | 中 | 알려진 CRS(UTM/3857)부터, RTC 철저 적용, 소용량으로 시각 검증 |
-| laz-perf 디코드 성능 | 中 | 워커 풀, 노드 캐시, pointBudget 상한 |
+| ~~laz-perf 디코드 성능~~ | ~~中~~ → **해소** | 워커 풀 도입(§8.3). 측정 결과 애초에 병목이 아니었음 — 남는 병목은 Cesium 메인 스레드 트랜스코드와 네트워크 대역폭이며 둘 다 우리 코드 밖 |
 | copc/laz-perf 0.0.x 프리릴리스 | 低 | 버전 핀, 필요시 fork |
 | Cesium private API 회피 | — | A 채택으로 대부분 회피(공개 API 사용) |
 

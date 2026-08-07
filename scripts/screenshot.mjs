@@ -81,6 +81,10 @@ if (stats?.tilesetUrl) {
   stats.tilesetJsonBytes = await page
     .evaluate(async (u) => (await (await fetch(u)).arrayBuffer()).byteLength, stats.tilesetUrl)
     .catch(() => null);
+  // Where the Service Worker actually decoded: pool vs its own thread.
+  stats.swDecode = await page
+    .evaluate(async (u) => (await fetch(new URL('stats.json', u).href)).json(), stats.tilesetUrl)
+    .catch(() => null);
 }
 
 console.log('=== LOD METRICS ===');

@@ -1,11 +1,13 @@
 // PointStream3D — stream COPC point clouds directly in CesiumJS, no pre-tiling.
 //
-// The package also ships two runtime assets that must be served by your app:
-// `pointstream3d-sw.js` and `laz-perf.wasm`, side by side. See the README.
+// The package also ships three runtime assets that must be served by your app,
+// side by side: `pointstream3d-sw.js`, `pointstream3d-worker.js` and
+// `laz-perf.wasm`. See the README.
 
 export {
   COPCPointCloud,
   COPC_DEFAULTS,
+  type COPCDecodePoolOptions,
   type COPCPointCloudOptions,
   type COPCPointCloudShadingOptions,
   type COPCServiceWorkerOptions,

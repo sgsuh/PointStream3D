@@ -24,6 +24,7 @@
       "import": "./dist/pointstream3d.js"
     },
     "./pointstream3d-sw.js": "./dist/pointstream3d-sw.js",
+    "./pointstream3d-worker.js": "./dist/pointstream3d-worker.js",
     "./laz-perf.wasm": "./dist/laz-perf.wasm",
     "./package.json": "./package.json"
   },

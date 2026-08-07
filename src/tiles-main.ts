@@ -7,6 +7,7 @@ import {
   Color,
   HeadingPitchRange,
   Math as CesiumMath,
+  RequestScheduler,
 } from 'cesium';
 import 'cesium/Build/Cesium/Widgets/widgets.css';
 import { COPCPointCloud, COPC_DEFAULTS, type COPCColorMode } from './index';
@@ -59,6 +60,17 @@ function buildColorSwitcher(cloud: COPCPointCloud): void {
 }
 
 async function main() {
+  // `?maxreq=` raises Cesium's per-server request cap (default 6). Tiles come
+  // from the Service Worker, not a real server, so the cap throttles our own
+  // pipeline rather than protecting anything.
+  if (params.has('maxreq')) {
+    RequestScheduler.maximumRequestsPerServer = Number(params.get('maxreq'));
+    RequestScheduler.maximumRequests = Math.max(
+      RequestScheduler.maximumRequests,
+      Number(params.get('maxreq')),
+    );
+  }
+
   const viewer = new Viewer('cesiumContainer', {
     baseLayer: false as unknown as undefined,
     baseLayerPicker: false,
@@ -84,6 +96,8 @@ async function main() {
     // Carry every attribute so the switcher can change mode without refetching.
     // `?attrs=0` drops them, for measuring what that costs.
     attributes: params.get('attrs') === '0' ? [] : ['intensity', 'classification', 'height'],
+    // `?workers=0` decodes inside the Service Worker, for measuring the pool.
+    ...(params.has('workers') ? { decodePool: { count: Number(params.get('workers')) } } : {}),
     maxTilesPerChunk: num('mt', COPC_DEFAULTS.maxTilesPerChunk),
     cacheBytes: num('cache', COPC_DEFAULTS.cacheBytes / (1024 * 1024)) * 1024 * 1024,
     dynamicScreenSpaceError: params.get('dyn') === '1',
@@ -128,6 +142,8 @@ async function main() {
       const r6 = (v: number) => Number(v.toFixed(6));
       return {
         loadMs,
+        workerCount: cloud.workerCount,
+        hardwareConcurrency: navigator.hardwareConcurrency ?? null,
         // Copy this into ?cam= to replay the exact framing in an A/B run.
         cam: [
           r6(CesiumMath.toDegrees(carto.longitude)),

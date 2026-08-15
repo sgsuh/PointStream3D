@@ -16,14 +16,18 @@ export function defaultWorkerCount(): number {
   return Math.max(1, Math.min(6, cores - 1));
 }
 
-let nextPoolId = 1;
 let listening = false;
 
 /** Pools are shared by worker URL, so two point clouds do not double the threads. */
 const live = new Map<string, { pool: DecodePool; refs: number }>();
 
 export class DecodePool {
-  readonly id = `pool-${nextPoolId++}`;
+  /**
+   * Pool ids cross into the Service Worker, which serves every page in its
+   * scope, so a per-page counter would collide: releasing this tab's pool would
+   * drop another tab's ports. A uuid is unique across tabs and across reloads.
+   */
+  readonly id = `pool-${crypto.randomUUID()}`;
   private workers: Worker[] = [];
 
   constructor(
@@ -95,4 +99,18 @@ function listen(): void {
   });
   // A new Service Worker taking over has no ports either.
   navigator.serviceWorker.addEventListener('controllerchange', rewire);
+
+  // The workers die with the page, but the Service Worker outlives it and keeps
+  // their ports: without this, every reload leaves a pool of dead ports behind,
+  // and each tile routed to one waits out the decode timeout before falling back
+  // inline. `pagehide` rather than `unload` — it still fires on mobile and does
+  // not disqualify the page from bfcache. A page restored from bfcache has live
+  // workers but no registered ports; the Service Worker notices an empty pool
+  // and asks for them again.
+  if (typeof window === 'undefined') return;
+  window.addEventListener('pagehide', () => {
+    const sw = navigator.serviceWorker.controller;
+    if (!sw) return;
+    for (const { pool } of live.values()) sw.postMessage({ type: RELEASE, poolId: pool.id });
+  });
 }

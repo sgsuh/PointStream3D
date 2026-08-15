@@ -103,6 +103,8 @@ function getPage(source: CopcSource, src: string, page: Hierarchy.Page): Promise
 interface PoolWorker {
   port: MessagePort;
   poolId: string;
+  /** The page that owns the worker: the port dies when that page goes away. */
+  clientId: string;
   /** Requests sent and not yet answered, so work goes to the idlest worker. */
   inflight: number;
 }
@@ -149,8 +151,8 @@ async function timed(kind: 'pool' | 'inline', work: Promise<ArrayBuffer>): Promi
   }
 }
 
-function attachPort(port: MessagePort, poolId: string): void {
-  const worker: PoolWorker = { port, poolId, inflight: 0 };
+function attachPort(port: MessagePort, poolId: string, clientId: string): void {
+  const worker: PoolWorker = { port, poolId, clientId, inflight: 0 };
   port.onmessage = (event: MessageEvent) => {
     const response = event.data as DecodeResponse;
     worker.inflight = Math.max(0, worker.inflight - 1);
@@ -166,6 +168,20 @@ function attachPort(port: MessagePort, poolId: string): void {
 function dropWorker(worker: PoolWorker): void {
   const i = pool.indexOf(worker);
   if (i >= 0) pool.splice(i, 1);
+}
+
+/**
+ * A port whose page is gone still accepts `postMessage` silently and never
+ * answers, so a tile routed to one waits out `DECODE_TIMEOUT_MS` before falling
+ * back inline. The page hands its ports back on `pagehide`, but that message
+ * cannot be sent by a tab that crashed or was killed. Sweep on handover, which
+ * is precisely when a replacement pool has arrived and any predecessor is dead.
+ */
+async function reapDeadClients(): Promise<void> {
+  const alive = new Set((await self.clients.matchAll({ type: 'window' })).map((c) => c.id));
+  for (const worker of pool.filter((w) => w.clientId && !alive.has(w.clientId))) {
+    dropWorker(worker);
+  }
 }
 
 /**
@@ -207,7 +223,12 @@ self.addEventListener('message', (event) => {
   const data = event.data as { type?: string; src?: string; poolId?: string } | undefined;
 
   if (data?.type === POOL_PORT && event.ports[0] && data.poolId) {
-    attachPort(event.ports[0], data.poolId);
+    const clientId = (event.source as Client | null)?.id ?? '';
+    // One sweep per page, not per port: the pool holds one port per worker and
+    // they all arrive together.
+    const firstOfClient = !pool.some((w) => w.clientId === clientId);
+    attachPort(event.ports[0], data.poolId, clientId);
+    if (firstOfClient) void reapDeadClients();
     return;
   }
 
